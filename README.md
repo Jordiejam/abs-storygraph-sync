@@ -19,10 +19,18 @@ Runs as a lightweight Docker container alongside ABS. No browser automation — 
 
 ### 1. Run with Docker Compose
 
+Clone this fork and check out the edition-aware matcher branch:
+
+```sh
+git clone --branch feature/edition-aware-matcher https://github.com/Jordiejam/abs-storygraph-sync.git
+cd abs-storygraph-sync
+```
+
 ```yaml
 services:
   abs-storygraph-sync:
-    image: ghcr.io/dukko/abs-storygraph-sync:latest
+    build: .
+    image: abs-storygraph-sync:local
     restart: unless-stopped
     network_mode: host
     volumes:
@@ -36,7 +44,7 @@ services:
 ```
 
 ```sh
-docker compose up -d
+docker compose up -d --build
 ```
 
 Open **http://your-server:5465** — the first visit prompts you to create an account, which becomes an admin. Admins can add more local accounts from the **Users** panel; anyone who signs in via SSO gets an account automatically on first login.
