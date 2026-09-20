@@ -215,6 +215,33 @@
       padding-top: 0.625rem;
     }
 
+    .book-actions { display: flex; gap: 0.5rem; }
+
+    .history-summary {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+      gap: 0.75rem;
+      margin-bottom: 1rem;
+    }
+    .history-stat {
+      padding: 0.75rem;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+    .history-stat strong { display: block; font-size: 1rem; }
+    .history-stat span { color: var(--text-muted); font-size: 0.68rem; }
+    .history-table-wrap { overflow-x: auto; }
+    .history-table { width: 100%; border-collapse: collapse; font-size: 0.76rem; }
+    .history-table th, .history-table td {
+      padding: 0.6rem 0.7rem;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    .history-table th { color: var(--text-muted); font-weight: 600; }
+    .history-note { color: var(--text-muted); font-size: 0.72rem; margin-top: 0.75rem; }
+
     .empty-state {
       color: var(--text-muted);
       font-size: 0.875rem;
@@ -424,6 +451,14 @@
     <div class="sync-result" id="sync-result"></div>
   </div>
 
+  <div class="card" id="history-card" style="display:none">
+    <div class="section-header">
+      <h2 id="history-title">History Preview</h2>
+      <button class="btn btn-ghost" onclick="closeHistory()">Close</button>
+    </div>
+    <div id="history-content"></div>
+  </div>
+
   <!-- Settings -->
   <div class="card">
     <div class="section-header"><h2>Settings</h2></div>
@@ -573,10 +608,56 @@
                 <span>${b.current_minutes} / ${b.duration_minutes} min</span>
               </div>
             </div>
-            <div class="last-sync">${esc(syncedLabel)}</div>
-          </div>`;
+          <div class="last-sync">${esc(syncedLabel)}</div>
+          <div class="book-actions">
+            <button class="btn btn-ghost" onclick="previewHistory('${b.abs_item_id}')">Preview history</button>
+          </div>
+        </div>`;
       }).join('');
     } catch(e) {}
+  }
+
+  async function previewHistory(itemId) {
+    const card = document.getElementById('history-card');
+    const content = document.getElementById('history-content');
+    card.style.display = 'block';
+    content.innerHTML = '<div class="empty-state">Loading ABS listening sessions…</div>';
+    card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    try {
+      const d = await (await fetch(`/api/history-preview/${encodeURIComponent(itemId)}`)).json();
+      if (d.error) throw new Error(d.error);
+      document.getElementById('history-title').textContent = `History Preview — ${d.book.title}`;
+      const s = d.summary;
+      const rows = (d.days || []).map(day => `
+        <tr>
+          <td>${esc(day.date)}</td>
+          <td>${day.session_count}</td>
+          <td>${day.listening_minutes} min</td>
+          <td>${day.end_position_minutes} min</td>
+          <td>${day.progress_percent == null ? '—' : day.progress_percent + '%'}</td>
+          <td>${day.flags.length ? esc(day.flags.join(', ')) : '✓'}</td>
+        </tr>`).join('');
+      content.innerHTML = `
+        <div class="history-summary">
+          <div class="history-stat"><strong>${s.session_count}</strong><span>ABS sessions</span></div>
+          <div class="history-stat"><strong>${s.day_count}</strong><span>Listening days</span></div>
+          <div class="history-stat"><strong>${s.total_listening_minutes} min</strong><span>Time listened</span></div>
+          <div class="history-stat"><strong>${esc(s.confidence)}</strong><span>Preview confidence</span></div>
+        </div>
+        <div class="history-table-wrap">
+          <table class="history-table">
+            <thead><tr><th>Date</th><th>Sessions</th><th>Listened</th><th>End position</th><th>Progress</th><th>Review</th></tr></thead>
+            <tbody>${rows || '<tr><td colspan="6">No usable sessions found.</td></tr>'}</tbody>
+          </table>
+        </div>
+        <div class="history-note">Read-only preview. Nothing on this screen is sent to StoryGraph.</div>`;
+    } catch (e) {
+      content.innerHTML = `<div class="empty-state">${esc(e.message || 'Could not load history')}</div>`;
+    }
+  }
+
+  function closeHistory() {
+    document.getElementById('history-card').style.display = 'none';
   }
 
   function setDot(dotId, lblId, ok, label) {
