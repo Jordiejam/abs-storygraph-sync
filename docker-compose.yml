@@ -3,7 +3,8 @@ services:
     build: .
     image: abs-storygraph-sync:local
     restart: unless-stopped
-    network_mode: host
+    ports:
+      - "${WEB_PORT:-5465}:5465"
     volumes:
       - ./data:/app/data  # persists accounts, per-user settings, and sync state
     environment:
