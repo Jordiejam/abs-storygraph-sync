@@ -64,6 +64,21 @@ Use the actual Audiobookshelf service name, internal port, host address, and
 published port from your deployment. Normal bridge networking and a published
 web port are used so the sync service works across Linux and Docker Desktop.
 
+### Development mode
+
+For local development, layer the development override onto the normal Compose
+file:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+```
+
+Python files and templates are bind-mounted into the container and Flask
+reloads them when they change, so routine source changes only need a `git pull`,
+not an image rebuild. Development mode is explicitly read-only: the background
+poller is stopped and the manual sync endpoint is blocked. Rebuild only after a
+dependency or Dockerfile change.
+
 ### 2. Get your ABS API token
 
 In Audiobookshelf: **Settings → Users → your user → API Token**
