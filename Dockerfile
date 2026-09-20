@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 COPY matcher.py .
+COPY history.py .
 COPY templates/ templates/
 
 ENV PORT=5465
