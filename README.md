@@ -32,7 +32,8 @@ services:
     build: .
     image: abs-storygraph-sync:local
     restart: unless-stopped
-    network_mode: host
+    ports:
+      - "${WEB_PORT:-5465}:5465"
     volumes:
       - ./data:/app/data
     environment:
@@ -48,6 +49,19 @@ docker compose up -d --build
 ```
 
 Open **http://your-server:5465** — the first visit prompts you to create an account, which becomes an admin. Admins can add more local accounts from the **Users** panel; anyone who signs in via SSO gets an account automatically on first login.
+
+The ABS URL depends on how the two services can reach each other:
+
+| Setup | Example ABS URL |
+|---|---|
+| Same Docker network | `http://audiobookshelf:80` |
+| Docker Desktop, using ABS's published port | `http://host.docker.internal:13378` |
+| ABS elsewhere on your LAN | `http://192.168.1.20:13378` |
+| Public/reverse-proxied ABS | `https://abs.example.com` |
+
+Use the actual Audiobookshelf service name, internal port, host address, and
+published port from your deployment. Normal bridge networking and a published
+web port are used so the sync service works across Linux and Docker Desktop.
 
 ### 2. Get your ABS API token
 
