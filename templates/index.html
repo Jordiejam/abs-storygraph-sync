@@ -231,6 +231,9 @@
     }
     .history-stat strong { display: block; font-size: 1rem; }
     .history-stat span { color: var(--text-muted); font-size: 0.68rem; }
+    .history-stat.confidence-high strong { color: var(--green); }
+    .history-stat.confidence-review strong { color: var(--yellow); }
+    .history-stat.confidence-insufficient strong { color: var(--text-dim); }
     .history-table-wrap { overflow-x: auto; }
     .history-table { width: 100%; border-collapse: collapse; font-size: 0.76rem; }
     .history-table th, .history-table td {
@@ -241,6 +244,18 @@
     }
     .history-table th { color: var(--text-muted); font-weight: 600; }
     .history-note { color: var(--text-muted); font-size: 0.72rem; margin-top: 0.75rem; }
+    .history-callouts { display: flex; flex-direction: column; gap: 0.4rem; margin-bottom: 1rem; }
+    .history-callouts .history-note { margin-top: 0; }
+    .tag {
+      display: inline-block;
+      padding: 0.15rem 0.5rem;
+      border-radius: 100px;
+      font-size: 0.7rem;
+      font-weight: 500;
+      white-space: nowrap;
+    }
+    .tag-ok { color: var(--green); background: rgba(52, 211, 153, 0.1); }
+    .tag-warn { color: var(--yellow); background: rgba(251, 191, 36, 0.1); margin-right: 0.3rem; }
 
     .empty-state {
       color: var(--text-muted);
@@ -621,6 +636,22 @@
     } catch(e) {}
   }
 
+  const CONFIDENCE_INFO = {
+    high: { label: 'High', text: 'Sessions line up cleanly and the furthest position moved forward steadily — this looks safe to trust.' },
+    review: { label: 'Needs a look', text: 'A few days show rewinds, re-listening, or no forward progress. Worth skimming the flagged rows below before importing anything.' },
+    insufficient: { label: 'Insufficient', text: 'Not enough usable session data (or a missing book runtime) to reconstruct daily progress yet.' },
+  };
+
+  const FLAG_INFO = {
+    rewind_or_relisten: 'Rewound / re-listened',
+    no_new_progress: 'No forward progress',
+  };
+
+  function flagBadges(flags) {
+    if (!flags || !flags.length) return '<span class="tag tag-ok">✓ On track</span>';
+    return flags.map(f => `<span class="tag tag-warn">${esc(FLAG_INFO[f] || f)}</span>`).join('');
+  }
+
   async function previewHistory(itemId) {
     const card = document.getElementById('history-card');
     const content = document.getElementById('history-content');
@@ -639,18 +670,31 @@
           <td>${day.listening_minutes} min</td>
           <td>${day.end_position_minutes} min</td>
           <td>${day.progress_percent == null ? '—' : day.progress_percent + '%'}</td>
-          <td>${day.flags.length ? esc(day.flags.join(', ')) : '✓'}</td>
+          <td>${flagBadges(day.flags)}</td>
         </tr>`).join('');
+
+      const ci = CONFIDENCE_INFO[s.confidence] || { label: s.confidence, text: '' };
+
+      const callouts = [];
+      if (s.skipped_session_count) {
+        callouts.push(`⚠ ${s.skipped_session_count} session${s.skipped_session_count === 1 ? '' : 's'} skipped — Audiobookshelf didn't include a usable date or position, so ${s.skipped_session_count === 1 ? 'it isn\'t' : 'they aren\'t'} counted above.`);
+      }
+      const gap = Math.round((s.total_listening_minutes - (s.latest_position_minutes || 0)) * 10) / 10;
+      if (gap > 1) {
+        callouts.push(`ℹ You listened to ${s.total_listening_minutes} min in total, but the furthest position only reached ${s.latest_position_minutes} min. The ${gap} min gap is most likely rewinds or re-listening to earlier parts, not lost progress.`);
+      }
+
       content.innerHTML = `
         <div class="history-summary">
           <div class="history-stat"><strong>${s.session_count}</strong><span>ABS sessions</span></div>
           <div class="history-stat"><strong>${s.day_count}</strong><span>Listening days</span></div>
           <div class="history-stat"><strong>${s.total_listening_minutes} min</strong><span>Time listened</span></div>
-          <div class="history-stat"><strong>${esc(s.confidence)}</strong><span>Preview confidence</span></div>
+          <div class="history-stat confidence-${esc(s.confidence)}"><strong>${esc(ci.label)}</strong><span>Preview confidence</span></div>
         </div>
+        ${ci.text ? `<div class="history-callouts"><p class="history-note">${esc(ci.text)}</p>${callouts.map(c => `<p class="history-note">${esc(c)}</p>`).join('')}</div>` : ''}
         <div class="history-table-wrap">
           <table class="history-table">
-            <thead><tr><th>Date</th><th>Sessions</th><th>Listened</th><th>End position</th><th>Progress</th><th>Review</th></tr></thead>
+            <thead><tr><th>Date</th><th>Sessions</th><th>Listened</th><th>End position</th><th>Progress</th><th>Notes</th></tr></thead>
             <tbody>${rows || '<tr><td colspan="6">No usable sessions found.</td></tr>'}</tbody>
           </table>
         </div>
@@ -743,12 +787,14 @@
       const msg = document.getElementById('save-msg');
       msg.classList.add('show');
       setTimeout(() => msg.classList.remove('show'), 4000);
-      // Clear fields after save
+      // Clear fields after save; re-derive "(already set)" per field from the
+      // backend instead of assuming every field got a value this submission
       ['s-abs-token','s-sg-session','s-sg-remember'].forEach(id => {
         document.getElementById(id).value = '';
-        document.getElementById(id).placeholder = '(already set)';
-        document.getElementById(id).classList.add('is-set');
+        document.getElementById(id).placeholder = '••••••••';
+        document.getElementById(id).classList.remove('is-set');
       });
+      await loadSettings();
       fetchStatus();
     }
   }

@@ -18,7 +18,7 @@ from history import build_history_preview
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 
-DATA_DIR = "/app/data"
+DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 USERS_FILE = f"{DATA_DIR}/users.json"
 CONFIG_DIR = f"{DATA_DIR}/config"
 SYNC_STATE_DIR = f"{DATA_DIR}/sync_state"
@@ -645,6 +645,12 @@ def _poll_loop():
 
 app = Flask(__name__)
 app.secret_key = _get_secret_key()
+if READ_ONLY:
+    # `flask run --reload` only restarts the process on .py changes, which
+    # incidentally picks up fresh templates too. A template-only edit never
+    # triggers that restart, so Jinja's cached template would otherwise go
+    # stale until something else causes a restart.
+    app.config["TEMPLATES_AUTO_RELOAD"] = True
 
 # Trust one hop of X-Forwarded-Proto/Host/For/Prefix from a reverse proxy in
 # front of the container (Caddy, nginx, Traefik, ...). Without this, Flask has
