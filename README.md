@@ -12,6 +12,7 @@ Runs as a lightweight Docker container alongside ABS. No browser automation — 
 - Configurable sync scope: just in-progress books, in-progress + finished, or your entire library
 - Web UI to manage credentials, view logs, and trigger a manual sync
 - Progress is only pushed to StoryGraph when it actually changes (no duplicate journal entries)
+- Matches the closest audiobook edition using ISBN/ASIN when available and the ABS runtime
 - Accounts, settings, and sync state persist across restarts
 
 ## Setup
@@ -94,8 +95,10 @@ Each user picks how much of their library to sync, in **Settings**:
 
 1. Every `POLL_INTERVAL` seconds, fetches each user's books from the ABS API (scoped per their Sync Scope setting)
 2. If any book has gained `SYNC_THRESHOLD_MINUTES` or more minutes since the last check, or has just been finished, it triggers a sync
-3. For each book to sync, searches StoryGraph by title/author, sets its status (to-read / currently-reading / read), and updates the progress percentage
+3. For each book to sync, searches StoryGraph by title/author, inspects that work's editions, and selects an audio edition by exact ISBN/ASIN or closest runtime
 4. Progress/status is only pushed if it actually changed since the last successful sync, preventing duplicate reading journal entries
+
+If no audio edition is within a conservative runtime tolerance, the sync leaves the book untouched rather than risk writing progress to the wrong edition. Successful edition choices are persisted against the stable Audiobookshelf item ID and reused on later syncs.
 
 StoryGraph has no public API — this tool uses session cookies to make the same requests the website does.
 

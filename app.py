@@ -13,6 +13,7 @@ from bs4 import BeautifulSoup
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
 from authlib.integrations.flask_client import OAuth
+from matcher import choose_audio_edition, parse_storygraph_editions
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 
@@ -244,9 +245,16 @@ def _item_to_book(item: dict, progress: dict) -> dict | None:
     title = metadata.get("title", "").strip()
     if not title:
         return None
+    identifiers = [
+        str(metadata[key]).strip()
+        for key in ("isbn", "asin")
+        if metadata.get(key) and str(metadata[key]).strip()
+    ]
     return {
+        "abs_item_id": item.get("id", ""),
         "title": title,
         "author": metadata.get("authorName", ""),
+        "identifiers": identifiers,
         "progress_percent": round((progress.get("progress") or 0) * 100, 1),
         "current_minutes": round((progress.get("currentTime") or 0) / 60, 1),
         "duration_minutes": round((media.get("duration") or 0) / 60, 1),
@@ -368,7 +376,7 @@ class StoryGraphClient:
         resp = self._get("/")
         return "sign_in" not in resp.url
 
-    def search_book(self, title, author) -> str | None:
+    def search_book(self, title, author, duration_minutes=0, identifiers=None) -> str | None:
         query = req.utils.quote(f"{title} {author}".strip())
         resp = self._get(f"/browse?search_term={query}")
         if resp.status_code != 200:
@@ -382,8 +390,38 @@ class StoryGraphClient:
         if link:
             m = re.search(r"/books/([^/?]+)", link.get("href", ""))
             if m:
-                logger.info("Found '%s' -> id=%s", title, m.group(1))
-                return m.group(1)
+                initial_id = m.group(1)
+                if not duration_minutes and not identifiers:
+                    logger.info("Found '%s' -> id=%s", title, initial_id)
+                    return initial_id
+
+                editions_resp = self._get(f"/books/{initial_id}/editions")
+                if editions_resp.status_code != 200:
+                    logger.warning("Could not load StoryGraph editions for '%s'", title)
+                    return None
+                candidates = parse_storygraph_editions(editions_resp.text)
+                matched = choose_audio_edition(
+                    candidates,
+                    target_duration_minutes=duration_minutes,
+                    identifiers=identifiers or [],
+                )
+                if matched:
+                    delta = abs((matched.duration_minutes or duration_minutes) - duration_minutes)
+                    logger.info(
+                        "Matched '%s' to audio edition id=%s (runtime %.1f min, delta %.1f min)",
+                        title,
+                        matched.book_id,
+                        matched.duration_minutes or 0,
+                        delta,
+                    )
+                    return matched.book_id
+                logger.warning(
+                    "No confident audio edition match for '%s' (ABS runtime %.1f min, %d candidates)",
+                    title,
+                    duration_minutes,
+                    len(candidates),
+                )
+                return None
         logger.warning("No StoryGraph result for '%s'", title)
         return None
 
@@ -475,6 +513,10 @@ def _target_status(book: dict) -> str:
     return "to-read"
 
 
+def _book_state_key(book: dict) -> str:
+    return book.get("abs_item_id") or f"{book['title']}|{book.get('author', '')}"
+
+
 def do_sync(user_id: str, books: list[dict]) -> list[dict]:
     user = get_user(user_id)
     label = (user or {}).get("username") or (user or {}).get("display_name") or user_id
@@ -488,15 +530,23 @@ def do_sync(user_id: str, books: list[dict]) -> list[dict]:
         try:
             pct = book["progress_percent"]
             status = _target_status(book)
-            prev = synced.get(book["title"])
+            state_key = _book_state_key(book)
+            prev = synced.get(state_key) or synced.get(book["title"])
             if prev is not None and prev.get("status") == status and abs(pct - prev.get("pct", -1)) < 0.5:
                 logger.info("[%s] '%s' unchanged (%s, %.1f%%) — skipping", label, book["title"], status, pct)
                 results.append({"title": book["title"], "status": "unchanged", "progress_percent": pct})
                 continue
 
-            book_id = client.search_book(book["title"], book["author"])
+            book_id = prev.get("storygraph_book_id") if prev else None
             if not book_id:
-                results.append({"title": book["title"], "status": "not_found"})
+                book_id = client.search_book(
+                    book["title"],
+                    book["author"],
+                    duration_minutes=book.get("duration_minutes", 0),
+                    identifiers=book.get("identifiers", []),
+                )
+            if not book_id:
+                results.append({"title": book["title"], "status": "not_found", "reason": "no_confident_audio_edition"})
                 continue
             ok, already_matched, status_html = client.ensure_status(book_id, status)
             target_pct = 100 if status == "read" else pct
@@ -521,7 +571,9 @@ def do_sync(user_id: str, books: list[dict]) -> list[dict]:
             if not skip_progress:
                 ok = client.update_progress(book_id, target_pct, html=status_html)
             if ok:
-                synced[book["title"]] = {"pct": pct, "status": status}
+                synced[state_key] = {"pct": pct, "status": status, "storygraph_book_id": book_id}
+                if state_key != book["title"]:
+                    synced.pop(book["title"], None)
                 _save_sync_state(user_id, synced)
             results.append({
                 "title": book["title"],
@@ -549,14 +601,14 @@ def _poll_user(user: dict):
         with _last_synced_lock:
             last = _last_synced.setdefault(user_id, {})
             for b in books:
-                prev = last.get(b["title"], 0.0)
+                prev = last.get(_book_state_key(b), 0.0)
                 if b["is_finished"] or b["current_minutes"] - prev >= SYNC_THRESHOLD:
                     to_sync.append(b)
         if to_sync:
             results = do_sync(user_id, to_sync)
             with _last_synced_lock:
                 for b in to_sync:
-                    _last_synced[user_id][b["title"]] = b["current_minutes"]
+                    _last_synced[user_id][_book_state_key(b)] = b["current_minutes"]
             synced = sum(1 for r in results if r["status"] == "success")
             logger.info("[%s] Auto-sync: %d/%d synced", label, synced, len(to_sync))
     except Exception as e:
@@ -736,7 +788,7 @@ def api_sync():
         with _last_synced_lock:
             last = _last_synced.setdefault(user_id, {})
             for b in books:
-                last[b["title"]] = b["current_minutes"]
+                last[_book_state_key(b)] = b["current_minutes"]
         synced = sum(1 for r in results if r["status"] == "success")
         return jsonify({"message": "Sync complete", "synced": synced, "total": len(books), "results": results})
     except Exception as e:
