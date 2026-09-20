@@ -26,6 +26,7 @@ SYNC_STATE_DIR = f"{DATA_DIR}/sync_state"
 STORYGRAPH_BASE = "https://app.thestorygraph.com"
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 600))
 SYNC_THRESHOLD = float(os.environ.get("SYNC_THRESHOLD_MINUTES", 5))
+READ_ONLY = os.environ.get("READ_ONLY", "false").lower() in {"1", "true", "yes", "on"}
 
 OIDC_ISSUER = os.environ.get("OIDC_ISSUER")
 OIDC_CLIENT_ID = os.environ.get("OIDC_CLIENT_ID")
@@ -782,7 +783,8 @@ def api_status():
     return jsonify({
         "abs_ok": abs_ok,
         "sg_ok": bool(cfg(user_id, "STORYGRAPH_SESSION")),
-        "auto_sync": True,
+        "auto_sync": not READ_ONLY,
+        "read_only": READ_ONLY,
         "poll_interval": POLL_INTERVAL,
         "sync_threshold": SYNC_THRESHOLD,
         "sync_scope": scope,
@@ -794,6 +796,8 @@ def api_status():
 @app.route("/api/sync", methods=["POST"])
 def api_sync():
     user_id = g.user["id"]
+    if READ_ONLY:
+        return jsonify({"error": "Sync is disabled in read-only development mode"}), 403
     missing = [k for k in ("ABS_URL", "ABS_TOKEN", "STORYGRAPH_SESSION") if not cfg(user_id, k)]
     if missing:
         return jsonify({"error": f"Missing: {', '.join(missing)}"}), 500
@@ -824,14 +828,18 @@ def api_history_preview(item_id):
         return jsonify({"error": f"Missing: {', '.join(missing)}"}), 400
 
     try:
-        item = _abs_get(user_id, f"/api/items/{item_id}").json()
-        progress_resp = req.get(
-            f"{cfg(user_id, 'ABS_URL')}/api/me/progress/{item_id}",
-            headers=_abs_headers(user_id),
-            timeout=10,
-        )
-        progress = progress_resp.json() if progress_resp.status_code == 200 else {}
-        book = _item_to_book(item, progress)
+        scope = cfg(user_id, "SYNC_SCOPE", "in_progress")
+        books, _ = get_cached_books(user_id, scope)
+        book = next((candidate for candidate in books if candidate.get("abs_item_id") == item_id), None)
+        if not book:
+            item = _abs_get(user_id, f"/api/items/{item_id}").json()
+            progress_resp = req.get(
+                f"{cfg(user_id, 'ABS_URL')}/api/me/progress/{item_id}",
+                headers=_abs_headers(user_id),
+                timeout=10,
+            )
+            progress = progress_resp.json() if progress_resp.status_code == 200 else {}
+            book = _item_to_book(item, progress)
         if not book:
             return jsonify({"error": "Audiobook metadata was incomplete"}), 422
         sessions = get_abs_listening_sessions(user_id, item_id)
@@ -937,5 +945,6 @@ def api_set_admin(user_id):
 
 
 if __name__ == "__main__":
-    threading.Thread(target=_poll_loop, daemon=True).start()
+    if not READ_ONLY:
+        threading.Thread(target=_poll_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
