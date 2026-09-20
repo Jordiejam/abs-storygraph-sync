@@ -14,6 +14,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
 from authlib.integrations.flask_client import OAuth
 from matcher import choose_audio_edition, parse_storygraph_editions
+from history import build_history_preview
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 
@@ -314,6 +315,23 @@ def get_abs_books(user_id: str, scope: str) -> list[dict]:
             if not results or page * 100 >= total:
                 break
     return books
+
+
+def get_abs_listening_sessions(user_id: str, item_id: str) -> list[dict]:
+    sessions = []
+    page = 0
+    while True:
+        data = _abs_get(
+            user_id,
+            f"/api/me/item/listening-sessions/{item_id}",
+            params={"page": page, "itemsPerPage": 100},
+        ).json()
+        sessions.extend(data.get("sessions", []))
+        num_pages = int(data.get("numPages") or 0)
+        page += 1
+        if page >= num_pages:
+            break
+    return sessions
 
 # ── StoryGraph ────────────────────────────────────────────────────────────────
 
@@ -794,6 +812,45 @@ def api_sync():
     except Exception as e:
         logger.error("Sync failed: %s", e)
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/history-preview/<item_id>")
+def api_history_preview(item_id):
+    user_id = g.user["id"]
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", item_id):
+        return jsonify({"error": "Invalid Audiobookshelf item ID"}), 400
+    missing = [k for k in ("ABS_URL", "ABS_TOKEN") if not cfg(user_id, k)]
+    if missing:
+        return jsonify({"error": f"Missing: {', '.join(missing)}"}), 400
+
+    try:
+        item = _abs_get(user_id, f"/api/items/{item_id}").json()
+        progress_resp = req.get(
+            f"{cfg(user_id, 'ABS_URL')}/api/me/progress/{item_id}",
+            headers=_abs_headers(user_id),
+            timeout=10,
+        )
+        progress = progress_resp.json() if progress_resp.status_code == 200 else {}
+        book = _item_to_book(item, progress)
+        if not book:
+            return jsonify({"error": "Audiobook metadata was incomplete"}), 422
+        sessions = get_abs_listening_sessions(user_id, item_id)
+        preview = build_history_preview(sessions, book["duration_minutes"])
+        return jsonify({
+            "book": {
+                "abs_item_id": item_id,
+                "title": book["title"],
+                "author": book["author"],
+                "duration_minutes": book["duration_minutes"],
+                "current_minutes": book["current_minutes"],
+                "progress_percent": book["progress_percent"],
+            },
+            **preview,
+            "read_only": True,
+        })
+    except req.RequestException as exc:
+        logger.warning("ABS history preview failed for %s: %s", item_id, exc)
+        return jsonify({"error": "Could not load listening history from Audiobookshelf"}), 502
 
 
 @app.route("/api/logs")
