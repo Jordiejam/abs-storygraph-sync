@@ -7,5 +7,6 @@ services:
       - ./app.py:/app/app.py
       - ./matcher.py:/app/matcher.py
       - ./history.py:/app/history.py
+      - ./journal.py:/app/journal.py
       - ./templates:/app/templates
       - ./data:/app/data
