@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date as date_cls, datetime, timezone
 import re
 
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_GAP_DAYS_THRESHOLD = 7
+# New progress worth more than this multiple of the day's actual listening
+# time didn't come from listening — but never flag a jump smaller than the
+# floor, where normal seeking easily clears any ratio.
+_JUMP_RATIO_THRESHOLD = 3
+_JUMP_MINUTES_FLOOR = 10
 
 
 def _number(value, default=0.0) -> float:
@@ -64,10 +70,18 @@ def build_history_preview(sessions: list[dict], duration_minutes: float) -> dict
     days = []
     furthest = 0.0
     suspicious_days = 0
+    previous_date: date_cls | None = None
     for date in sorted(grouped):
         raw = grouped[date]
         raw_position = raw["furthest_session_position"]
+        listening_minutes = raw["listening_seconds"] / 60
         flags = []
+
+        this_date = date_cls.fromisoformat(date)
+        if previous_date is not None and (this_date - previous_date).days > _GAP_DAYS_THRESHOLD:
+            flags.append("gap")
+        previous_date = this_date
+
         if raw_position + 60 < furthest:
             flags.append("rewind_or_relisten")
         previous = furthest
@@ -76,14 +90,19 @@ def build_history_preview(sessions: list[dict], duration_minutes: float) -> dict
             furthest = min(furthest, duration_seconds)
         if furthest <= previous + 1:
             flags.append("no_new_progress")
+
+        new_progress_minutes = max(0.0, furthest - previous) / 60
+        if new_progress_minutes > max(listening_minutes * _JUMP_RATIO_THRESHOLD, _JUMP_MINUTES_FLOOR):
+            flags.append("large_jump")
+
         if flags:
             suspicious_days += 1
 
         days.append({
             "date": date,
             "session_count": raw["session_count"],
-            "listening_minutes": round(raw["listening_seconds"] / 60, 1),
-            "new_progress_minutes": round(max(0.0, furthest - previous) / 60, 1),
+            "listening_minutes": round(listening_minutes, 1),
+            "new_progress_minutes": round(new_progress_minutes, 1),
             "end_position_minutes": round(furthest / 60, 1),
             "progress_percent": round((furthest / duration_seconds) * 100, 1) if duration_seconds else None,
             "flags": flags,
@@ -111,3 +130,19 @@ def build_history_preview(sessions: list[dict], duration_minutes: float) -> dict
         },
         "days": days,
     }
+
+
+def day_key(date: str, end_position_minutes) -> str:
+    """Stable id for one proposed daily checkpoint, so a History Import can
+    recognise a day across reruns and never write it twice.
+
+    Only the date and end position go in: the key is stored inside one dict per
+    ABS item inside one file per user, so the user, item and StoryGraph edition
+    are already fixed by where it lives. Kept human-readable rather than hashed
+    so a bad import can be diagnosed by reading the state file.
+    """
+    try:
+        position = float(end_position_minutes)
+    except (TypeError, ValueError):
+        position = 0.0
+    return f"{date}@{position:.1f}"
