@@ -285,7 +285,7 @@
 
     .input-row { position: relative; }
 
-    input[type="text"], input[type="password"] {
+    input[type="text"], input[type="password"], input[type="time"] {
       width: 100%;
       background: var(--surface2);
       border: 1px solid var(--border);
@@ -539,6 +539,19 @@
           </div>
           <span class="hint">Which books to push to StoryGraph. "Entire Library" also marks untouched books as to-read.</span>
         </div>
+        <div class="field span2">
+          <label>Sync Frequency</label>
+          <div style="display:flex;gap:0.5rem;flex-wrap:wrap" id="mode-group">
+            <button type="button" class="btn btn-ghost mode-btn" data-mode="frequent">Every 10 Minutes</button>
+            <button type="button" class="btn btn-ghost mode-btn" data-mode="daily">Daily</button>
+          </div>
+          <span class="hint">Daily mode still syncs book starts and finishes within one polling interval.</span>
+        </div>
+        <div class="field" id="daily-time-field" style="display:none">
+          <label for="s-daily-time">Daily Sync Time</label>
+          <input type="time" id="s-daily-time" value="00:00">
+          <span class="hint" id="timezone-hint">Uses your local timezone.</span>
+        </div>
       </div>
       <div class="form-footer">
         <button type="submit" class="btn btn-primary">Save Settings</button>
@@ -595,6 +608,7 @@
   let timer;
   let shownLogs = 0;
   let selectedScope = 'in_progress';
+  let selectedMode = 'frequent';
   let readOnlyMode = false;
 
   const SCOPE_HEADERS = {
@@ -610,6 +624,18 @@
     };
   });
 
+  function renderSyncMode() {
+    document.querySelectorAll('.mode-btn').forEach(b => b.classList.toggle('active', b.dataset.mode === selectedMode));
+    document.getElementById('daily-time-field').style.display = selectedMode === 'daily' ? 'flex' : 'none';
+  }
+
+  document.querySelectorAll('.mode-btn').forEach(btn => {
+    btn.onclick = () => {
+      selectedMode = btn.dataset.mode;
+      renderSyncMode();
+    };
+  });
+
   // ── Status ────────────────────────────────────────────────────────────────
 
   async function fetchStatus() {
@@ -619,7 +645,11 @@
       setDot('d-abs', 'l-abs', d.abs_ok, 'ABS');
       setDot('d-sg',  'l-sg',  d.sg_ok,  'StoryGraph');
       readOnlyMode = Boolean(d.read_only);
-      document.getElementById('l-poll').textContent = readOnlyMode ? 'Read-only dev' : `Every ${d.poll_interval}s`;
+      document.getElementById('l-poll').textContent = readOnlyMode
+        ? 'Read-only dev'
+        : d.sync_mode === 'daily'
+          ? `Daily at ${d.daily_sync_time}`
+          : `Every ${Math.round(d.poll_interval / 60)} min`;
       document.getElementById('sync-btn').disabled = readOnlyMode;
       document.getElementById('sync-label').textContent = readOnlyMode ? 'Read-only mode' : 'Sync Now';
       document.getElementById('books-header').textContent = SCOPE_HEADERS[d.sync_scope] || 'Currently Listening';
@@ -978,6 +1008,10 @@
       });
       selectedScope = d.SYNC_SCOPE || 'in_progress';
       document.querySelectorAll('.scope-btn').forEach(b => b.classList.toggle('active', b.dataset.scope === selectedScope));
+      selectedMode = d.SYNC_MODE || 'frequent';
+      document.getElementById('s-daily-time').value = d.DAILY_SYNC_TIME || '00:00';
+      document.getElementById('timezone-hint').textContent = `Uses ${d.TIMEZONE || 'UTC'}.`;
+      renderSyncMode();
     } catch(e) {}
   }
 
@@ -995,6 +1029,9 @@
       if (v) payload[key] = v;
     }
     payload['SYNC_SCOPE'] = selectedScope;
+    payload['SYNC_MODE'] = selectedMode;
+    payload['DAILY_SYNC_TIME'] = document.getElementById('s-daily-time').value || '00:00';
+    payload['TIMEZONE'] = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
     const r = await fetch('/api/settings', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

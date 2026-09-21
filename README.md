@@ -8,7 +8,8 @@ Runs as a lightweight Docker container alongside ABS. No browser automation — 
 
 - Multi-user: everyone gets their own account, ABS/StoryGraph credentials, and sync state
 - Login via local username/password, or SSO through any OIDC provider (e.g. [PocketID](https://github.com/pocket-id/pocket-id))
-- Auto-syncs progress whenever you've listened to 5+ new minutes of a book
+- Configurable auto-sync frequency: every 10 minutes, or once daily at a chosen local time
+- Book starts and finishes sync promptly even when ordinary progress is set to daily
 - Configurable sync scope: just in-progress books, in-progress + finished, or your entire library
 - Web UI to manage credentials, view logs, and trigger a manual sync
 - Progress is only pushed to StoryGraph when it actually changes (no duplicate journal entries)
@@ -93,7 +94,7 @@ In Audiobookshelf: **Settings → Users → your user → API Token**
 
 ### 4. Enter your credentials
 
-Paste your ABS URL/token and StoryGraph cookies into the **Settings** card in the web UI (each account has its own). Optionally set the **Sync Scope** there too — see below.
+Paste your ABS URL/token and StoryGraph cookies into the **Settings** card in the web UI (each account has its own). You can also choose the sync scope and frequency there.
 
 ## Configuration
 
@@ -102,14 +103,14 @@ Instance-wide environment variables (set once by whoever deploys the container):
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `5465` | Port for the web UI |
-| `POLL_INTERVAL` | `600` | How often to check for new progress (seconds) |
-| `SYNC_THRESHOLD_MINUTES` | `5` | Minimum new minutes listened before triggering a sync |
+| `POLL_INTERVAL` | `600` | How often to check for progress and book start/finish transitions (seconds) |
+| `SYNC_THRESHOLD_MINUTES` | `5` | Minimum new minutes listened before triggering a sync in frequent mode |
 | `OIDC_ISSUER` | *(unset)* | Base URL of your OIDC provider (must expose `/.well-known/openid-configuration`) |
 | `OIDC_CLIENT_ID` | *(unset)* | OIDC client ID |
 | `OIDC_CLIENT_SECRET` | *(unset)* | OIDC client secret |
 | `PUBLIC_URL` | *(unset)* | Externally-visible base URL, e.g. `https://abs-sync.example.com` (no trailing slash). Only needed if auto-detection below doesn't work for your setup |
 
-Everything else — ABS credentials, StoryGraph cookies, sync scope — is per-user, set through the web UI, no restart needed.
+Everything else — ABS credentials, StoryGraph cookies, sync scope, and sync frequency — is per-user, set through the web UI, no restart needed.
 
 ### OIDC redirect URI
 
@@ -129,10 +130,19 @@ Each user picks how much of their library to sync, in **Settings**:
 - **+ Finished** — the above, plus books you've completed (marked "read" on StoryGraph)
 - **Entire Library** — every book, including ones you haven't started (marked "to-read" on StoryGraph)
 
+## Sync frequency
+
+Each user can choose:
+
+- **Every 10 Minutes** (default) — progress is pushed after at least `SYNC_THRESHOLD_MINUTES` of additional listening
+- **Daily** — ordinary progress is pushed once per day at the selected local time, which defaults to midnight (`00:00`)
+
+The app still checks Audiobookshelf every `POLL_INTERVAL` seconds in Daily mode, but only contacts StoryGraph when a book starts, a book finishes, the daily run is due, or the user selects **Sync Now**. The first check after enabling this version quietly records existing books so old starts and finishes are not replayed.
+
 ## How it works
 
-1. Every `POLL_INTERVAL` seconds, fetches each user's books from the ABS API (scoped per their Sync Scope setting)
-2. If any book has gained `SYNC_THRESHOLD_MINUTES` or more minutes since the last check, or has just been finished, it triggers a sync
+1. Every `POLL_INTERVAL` seconds, fetches one lightweight ABS progress snapshot per user
+2. Starts and finishes sync promptly; ordinary progress follows that user's frequent or daily setting
 3. For each book to sync, searches StoryGraph by title/author, inspects that work's editions, and selects an audio edition by exact ISBN/ASIN or closest runtime
 4. Progress/status is only pushed if it actually changed since the last successful sync, preventing duplicate reading journal entries
 

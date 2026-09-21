@@ -107,14 +107,15 @@ class _ImportRouteCase(unittest.TestCase):
     def setUp(self):
         self.data_dir = tempfile.mkdtemp(prefix="abs-sg-case-")
         for attr, path in (("CONFIG_DIR", "config"), ("SYNC_STATE_DIR", "sync_state"),
-                           ("IMPORT_STATE_DIR", "import_state")):
+                           ("IMPORT_STATE_DIR", "import_state"),
+                           ("SCHEDULER_STATE_DIR", "scheduler_state")):
             setattr(A, attr, f"{self.data_dir}/{path}")
         A.USERS_FILE = f"{self.data_dir}/users.json"
         A._config_store = A._UserJsonStore(A.CONFIG_DIR)
         A._sync_store = A._UserJsonStore(A.SYNC_STATE_DIR)
         A._import_store = A._UserJsonStore(A.IMPORT_STATE_DIR)
+        A._scheduler_store = A._UserJsonStore(A.SCHEDULER_STATE_DIR)
         A._status_cache.clear()
-        A._last_synced.clear()
 
         self._real_client = A.StoryGraphClient
         self._real_resolve = A._resolve_abs_book
@@ -360,6 +361,46 @@ class EditionOverrideTests(_ImportRouteCase):
 
         A.do_sync(user_id, [dict(self.book)])
         self.assertEqual({OTHER_ID}, set(posted), "an auto match must not hijack a synced book")
+
+    def test_short_reread_writes_start_before_the_unchanged_finish(self):
+        user_id = self.user["id"]
+        finished_book = dict(self.book, progress_percent=100.0, current_minutes=600.0, is_finished=True)
+        A._sync_store.get(user_id)[self.ITEM] = {
+            "pct": 100.0, "status": "read", "storygraph_book_id": AUDIO.book_id,
+        }
+        statuses = []
+        fake = FakeStoryGraph()
+        fake.ensure_status = lambda book_id, status: (statuses.append(status), (True, False, None))[1]
+        fake.update_progress = lambda book_id, pct, html=None: True
+        fake._parse_current_progress = lambda html: None
+        A.StoryGraphClient = lambda *a, **k: fake
+
+        results = A.do_sync(user_id, [finished_book], start_before_finish={self.ITEM})
+        self.assertEqual(["success"], [result["status"] for result in results])
+        self.assertEqual(["currently-reading", "read"], statuses)
+
+
+class SyncSettingsTests(_ImportRouteCase):
+    def test_sync_settings_default_to_frequent_and_midnight(self):
+        settings = self.client.get("/api/settings").get_json()
+        self.assertEqual("frequent", settings["SYNC_MODE"])
+        self.assertEqual("00:00", settings["DAILY_SYNC_TIME"])
+
+    def test_daily_settings_are_validated_and_saved(self):
+        self.assertEqual(400, self.client.post("/api/settings", json={"SYNC_MODE": "sometimes"}).status_code)
+        self.assertEqual(400, self.client.post("/api/settings", json={"DAILY_SYNC_TIME": "midnight"}).status_code)
+        self.assertEqual(400, self.client.post("/api/settings", json={"TIMEZONE": "Middle/Earth"}).status_code)
+
+        response = self.client.post("/api/settings", json={
+            "SYNC_MODE": "daily",
+            "DAILY_SYNC_TIME": "00:00",
+            "TIMEZONE": "Europe/London",
+        })
+        self.assertEqual(200, response.status_code)
+        settings = self.client.get("/api/settings").get_json()
+        self.assertEqual("daily", settings["SYNC_MODE"])
+        self.assertEqual("00:00", settings["DAILY_SYNC_TIME"])
+        self.assertEqual("Europe/London", settings["TIMEZONE"])
 
 
 if __name__ == "__main__":

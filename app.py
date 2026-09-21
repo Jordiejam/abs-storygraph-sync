@@ -7,7 +7,8 @@ from urllib.parse import urlparse
 from functools import wraps
 import os, re, json, logging, threading, time, uuid
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time as datetime_time
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import requests as req
 from bs4 import BeautifulSoup
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -24,6 +25,7 @@ USERS_FILE = f"{DATA_DIR}/users.json"
 CONFIG_DIR = f"{DATA_DIR}/config"
 SYNC_STATE_DIR = f"{DATA_DIR}/sync_state"
 IMPORT_STATE_DIR = f"{DATA_DIR}/import_state"
+SCHEDULER_STATE_DIR = f"{DATA_DIR}/scheduler_state"
 
 STORYGRAPH_BASE = "https://app.thestorygraph.com"
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 600))
@@ -42,6 +44,9 @@ OIDC_ENABLED = bool(OIDC_ISSUER and OIDC_CLIENT_ID and OIDC_CLIENT_SECRET)
 PUBLIC_URL = (os.environ.get("PUBLIC_URL") or "").rstrip("/")
 
 SYNC_SCOPES = ("in_progress", "in_progress_finished", "library")
+SYNC_MODES = ("frequent", "daily")
+DEFAULT_DAILY_SYNC_TIME = "00:00"
+DEFAULT_TIMEZONE = "UTC"
 
 
 def _get_secret_key() -> bytes:
@@ -208,6 +213,11 @@ _sync_store = _UserJsonStore(SYNC_STATE_DIR)
 # leaves correct partial state on disk.
 _import_store = _UserJsonStore(IMPORT_STATE_DIR)
 
+# Lifecycle transitions handled by auto-sync and the date of the most recent
+# daily run. Kept separate from _sync_store: that store only describes writes
+# that successfully reached StoryGraph.
+_scheduler_store = _UserJsonStore(SCHEDULER_STATE_DIR)
+
 
 def cfg(user_id: str, key: str, default: str = "") -> str:
     return _config_store.get(user_id).get(key) or default
@@ -260,35 +270,59 @@ def _item_to_book(item: dict, progress: dict) -> dict | None:
     return book
 
 
-def get_abs_books(user_id: str, scope: str) -> list[dict]:
+def get_abs_progress(user_id: str) -> dict[str, dict]:
+    """One lightweight snapshot of every progress record for this ABS user."""
+    me = _abs_get(user_id, "/api/me").json()
+    return {
+        progress["libraryItemId"]: progress
+        for progress in me.get("mediaProgress", [])
+        if progress.get("libraryItemId")
+    }
+
+
+def get_abs_book(user_id: str, item_id: str, progress: dict) -> dict | None:
+    item_resp = req.get(
+        f"{cfg(user_id, 'ABS_URL')}/api/items/{item_id}",
+        headers=_abs_headers(user_id),
+        timeout=10,
+    )
+    if item_resp.status_code != 200:
+        return None
+    return _item_to_book(item_resp.json(), progress)
+
+
+def get_abs_books(
+    user_id: str,
+    scope: str,
+    progress_by_item: dict[str, dict] | None = None,
+) -> list[dict]:
     if scope == "in_progress":
         resp = _abs_get(user_id, "/api/me/items-in-progress")
         books = []
         for item in resp.json().get("libraryItems", []):
             item_id = item.get("id", "")
-            progress = {}
-            if item_id:
+            if progress_by_item is not None:
+                progress = progress_by_item.get(item_id, {})
+            elif item_id:
                 pr = req.get(f"{cfg(user_id, 'ABS_URL')}/api/me/progress/{item_id}", headers=_abs_headers(user_id), timeout=10)
-                if pr.status_code == 200:
-                    progress = pr.json()
+                progress = pr.json() if pr.status_code == 200 else {}
+            else:
+                progress = {}
             book = _item_to_book(item, progress)
             if book:
                 books.append(book)
         return books
 
     # in_progress_finished / library both need every progress entry the user has
-    me = _abs_get(user_id, "/api/me").json()
-    progress_by_item = {p["libraryItemId"]: p for p in me.get("mediaProgress", []) if p.get("libraryItemId")}
+    if progress_by_item is None:
+        progress_by_item = get_abs_progress(user_id)
 
     if scope == "in_progress_finished":
         books = []
         for item_id, progress in progress_by_item.items():
             if not ((progress.get("currentTime") or 0) > 0 or progress.get("isFinished")):
                 continue
-            item_resp = req.get(f"{cfg(user_id, 'ABS_URL')}/api/items/{item_id}", headers=_abs_headers(user_id), timeout=10)
-            if item_resp.status_code != 200:
-                continue
-            book = _item_to_book(item_resp.json(), progress)
+            book = get_abs_book(user_id, item_id, progress)
             if book:
                 books.append(book)
         return books
@@ -598,9 +632,6 @@ class StoryGraphClient:
 
 # ── Sync logic ────────────────────────────────────────────────────────────────
 
-_last_synced: dict[str, dict[str, float]] = {}
-_last_synced_lock = threading.Lock()
-
 _status_cache: dict[str, dict] = {}
 _status_cache_lock = threading.Lock()
 STATUS_CACHE_TTL = 60  # seconds
@@ -632,7 +663,23 @@ def _book_state_key(book: dict) -> str:
     return book.get("abs_item_id") or f"{book['title']}|{book.get('author', '')}"
 
 
-def do_sync(user_id: str, books: list[dict]) -> list[dict]:
+def _last_synced_minutes(user_id: str, book: dict) -> float | None:
+    """Durable last position, with a migration fallback for older state files."""
+    previous = _sync_store.get(user_id).get(_book_state_key(book))
+    if not previous:
+        return None
+    if previous.get("current_minutes") is not None:
+        return float(previous["current_minutes"])
+    if previous.get("pct") is not None and book.get("duration_minutes"):
+        return round(book["duration_minutes"] * float(previous["pct"]) / 100, 1)
+    return None
+
+
+def do_sync(
+    user_id: str,
+    books: list[dict],
+    start_before_finish: set[str] | None = None,
+) -> list[dict]:
     user = get_user(user_id)
     label = (user or {}).get("username") or (user or {}).get("display_name") or user_id
     client = StoryGraphClient(cfg(user_id, "STORYGRAPH_SESSION"), cfg(user_id, "STORYGRAPH_REMEMBER_TOKEN"))
@@ -640,6 +687,7 @@ def do_sync(user_id: str, books: list[dict]) -> list[dict]:
         logger.error("[%s] StoryGraph session invalid — update STORYGRAPH_SESSION", label)
         return [{"title": b["title"], "status": "auth_error"} for b in books]
     synced = _sync_store.get(user_id)
+    start_before_finish = start_before_finish or set()
     results = []
     for book in books:
         try:
@@ -662,7 +710,12 @@ def do_sync(user_id: str, books: list[dict]) -> list[dict]:
                 )
                 prev = None
 
-            if prev is not None and prev.get("status") == status and abs(pct - prev.get("pct", -1)) < 0.5:
+            if (
+                state_key not in start_before_finish
+                and prev is not None
+                and prev.get("status") == status
+                and abs(pct - prev.get("pct", -1)) < 0.5
+            ):
                 logger.info("[%s] '%s' unchanged (%s, %.1f%%) — skipping", label, book["title"], status, pct)
                 results.append({"title": book["title"], "status": "unchanged", "progress_percent": pct})
                 continue
@@ -686,6 +739,21 @@ def do_sync(user_id: str, books: list[dict]) -> list[dict]:
             if not book_id:
                 results.append({"title": book["title"], "status": "not_found", "reason": "no_confident_audio_edition"})
                 continue
+
+            # A short book can be first observed after it has already finished.
+            # Preserve both lifecycle transitions without creating a separate
+            # StoryGraph write path for the scheduler.
+            if status == "read" and state_key in start_before_finish:
+                started_ok, _, _ = client.ensure_status(book_id, "currently-reading")
+                if not started_ok:
+                    results.append({
+                        "title": book["title"],
+                        "status": "failed",
+                        "progress_percent": pct,
+                        "current_minutes": book["current_minutes"],
+                    })
+                    continue
+
             ok, already_matched, status_html = client.ensure_status(book_id, status)
             target_pct = 100 if status == "read" else pct
             # Skip the progress POST when StoryGraph already agrees with us. "read" is
@@ -709,7 +777,12 @@ def do_sync(user_id: str, books: list[dict]) -> list[dict]:
             if not skip_progress:
                 ok = client.update_progress(book_id, target_pct, html=status_html)
             if ok:
-                synced[state_key] = {"pct": pct, "status": status, "storygraph_book_id": book_id}
+                synced[state_key] = {
+                    "pct": pct,
+                    "current_minutes": book["current_minutes"],
+                    "status": status,
+                    "storygraph_book_id": book_id,
+                }
                 if state_key != book["title"]:
                     synced.pop(book["title"], None)
                 _sync_store.save(user_id)
@@ -725,30 +798,156 @@ def do_sync(user_id: str, books: list[dict]) -> list[dict]:
     return results
 
 
-def _poll_user(user: dict):
+def _progress_lifecycle(progress: dict) -> tuple[int | str | None, int | str | None]:
+    """Stable tokens for lifecycle events, including older ABS responses that
+    omit their timestamps."""
+    started = progress.get("startedAt")
+    if started is None and ((progress.get("currentTime") or 0) > 0 or progress.get("isFinished")):
+        started = "started"
+    finished = progress.get("finishedAt")
+    if finished is None and progress.get("isFinished"):
+        finished = "finished"
+    return started, finished
+
+
+def _lifecycle_changes(progress_by_item: dict[str, dict], state: dict) -> dict[str, dict]:
+    """Return unhandled starts/finishes. The first snapshot is a quiet baseline
+    so an upgrade cannot replay a user's historical library."""
+    handled = state.setdefault("books", {})
+    if not state.get("initialized"):
+        for item_id, progress in progress_by_item.items():
+            started, finished = _progress_lifecycle(progress)
+            handled[item_id] = {
+                "handled_started_at": started,
+                "handled_finished_at": finished,
+            }
+        state["initialized"] = True
+        return {}
+
+    changes = {}
+    for item_id, progress in progress_by_item.items():
+        started, finished = _progress_lifecycle(progress)
+        item_state = handled.setdefault(item_id, {})
+        start_changed = started is not None and started != item_state.get("handled_started_at")
+        finish_changed = finished is not None and finished != item_state.get("handled_finished_at")
+        if start_changed or finish_changed:
+            changes[item_id] = {"start": start_changed, "finish": finish_changed}
+    return changes
+
+
+def _parse_daily_sync_time(value: str) -> tuple[int, int]:
+    parsed = datetime.strptime(value, "%H:%M")
+    return parsed.hour, parsed.minute
+
+
+def _daily_schedule(user_id: str, now: datetime | None = None) -> tuple[bool, str]:
+    timezone_name = cfg(user_id, "TIMEZONE", DEFAULT_TIMEZONE)
+    try:
+        user_timezone = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        user_timezone = ZoneInfo(DEFAULT_TIMEZONE)
+    local_now = (now or datetime.now(timezone.utc)).astimezone(user_timezone)
+    try:
+        hour, minute = _parse_daily_sync_time(cfg(user_id, "DAILY_SYNC_TIME", DEFAULT_DAILY_SYNC_TIME))
+    except (TypeError, ValueError):
+        hour, minute = _parse_daily_sync_time(DEFAULT_DAILY_SYNC_TIME)
+    scheduled = datetime.combine(local_now.date(), datetime_time(hour, minute), user_timezone)
+    today = local_now.date().isoformat()
+    ran_today = _scheduler_store.get(user_id).get("last_daily_run") == today
+    due = not ran_today and local_now >= scheduled
+    return due, today
+
+
+def _frequent_sync_candidates(user_id: str, books: list[dict]) -> list[dict]:
+    candidates = []
+    synced = _sync_store.get(user_id)
+    for book in books:
+        previous_state = synced.get(_book_state_key(book)) or {}
+        previous = _last_synced_minutes(user_id, book) or 0.0
+        newly_finished = book["is_finished"] and previous_state.get("status") != "read"
+        progressed = not book["is_finished"] and book["current_minutes"] - previous >= SYNC_THRESHOLD
+        if newly_finished or progressed:
+            candidates.append(book)
+    return candidates
+
+
+def _mark_handled_lifecycle(state: dict, progress: dict, item_id: str):
+    started, finished = _progress_lifecycle(progress)
+    item_state = state.setdefault("books", {}).setdefault(item_id, {})
+    if started is not None:
+        item_state["handled_started_at"] = started
+    if finished is not None:
+        item_state["handled_finished_at"] = finished
+    elif not progress.get("isFinished"):
+        item_state["handled_finished_at"] = None
+
+
+def _poll_user(user: dict, now: datetime | None = None):
     user_id = user["id"]
     if not all([cfg(user_id, "ABS_URL"), cfg(user_id, "ABS_TOKEN"), cfg(user_id, "STORYGRAPH_SESSION")]):
         return
     scope = cfg(user_id, "SYNC_SCOPE", "in_progress")
+    mode = cfg(user_id, "SYNC_MODE", "frequent")
     label = user.get("username") or user.get("display_name") or user_id
     try:
-        books = get_abs_books(user_id, scope)
-        with _status_cache_lock:
-            _status_cache[user_id] = {"books": books, "abs_ok": True, "ts": time.time()}
-        to_sync = []
-        with _last_synced_lock:
-            last = _last_synced.setdefault(user_id, {})
-            for b in books:
-                prev = last.get(_book_state_key(b), 0.0)
-                if b["is_finished"] or b["current_minutes"] - prev >= SYNC_THRESHOLD:
-                    to_sync.append(b)
+        progress_by_item = get_abs_progress(user_id)
+        scheduler_state = _scheduler_store.get(user_id)
+        was_initialized = bool(scheduler_state.get("initialized"))
+        changes = _lifecycle_changes(progress_by_item, scheduler_state)
+        synced_state = _sync_store.get(user_id)
+        for item_id, progress in progress_by_item.items():
+            # ABS can retain an old startedAt when a completed book is reopened.
+            # The last successful StoryGraph status still makes that transition
+            # unambiguous and keeps it retryable if the write fails.
+            if (
+                (progress.get("currentTime") or 0) > 0
+                and not progress.get("isFinished")
+                and (synced_state.get(item_id) or {}).get("status") == "read"
+            ):
+                changes.setdefault(item_id, {"start": False, "finish": False})["start"] = True
+        if not was_initialized:
+            _scheduler_store.save(user_id)
+
+        daily_due, local_date = _daily_schedule(user_id, now)
+        scheduled_run = mode == "daily" and daily_due
+        scoped_books = []
+        if mode == "frequent" or scheduled_run:
+            scoped_books = get_abs_books(user_id, scope, progress_by_item=progress_by_item)
+            with _status_cache_lock:
+                _status_cache[user_id] = {"books": scoped_books, "abs_ok": True, "ts": time.time()}
+
+        selected = (
+            _frequent_sync_candidates(user_id, scoped_books)
+            if mode == "frequent"
+            else list(scoped_books)
+        )
+        by_item = {_book_state_key(book): book for book in selected}
+        for item_id in changes:
+            if item_id not in by_item:
+                book = get_abs_book(user_id, item_id, progress_by_item[item_id])
+                if book:
+                    by_item[item_id] = book
+
+        to_sync = list(by_item.values())
+        results = []
         if to_sync:
-            results = do_sync(user_id, to_sync)
-            with _last_synced_lock:
-                for b in to_sync:
-                    _last_synced[user_id][_book_state_key(b)] = b["current_minutes"]
+            start_before_finish = {
+                item_id
+                for item_id, change in changes.items()
+                if change["start"] and change["finish"]
+            }
+            results = do_sync(user_id, to_sync, start_before_finish=start_before_finish)
+            for book, result in zip(to_sync, results):
+                item_id = book.get("abs_item_id")
+                if item_id and result["status"] in {"success", "unchanged"}:
+                    _mark_handled_lifecycle(scheduler_state, progress_by_item.get(item_id, {}), item_id)
             synced = sum(1 for r in results if r["status"] == "success")
             logger.info("[%s] Auto-sync: %d/%d synced", label, synced, len(to_sync))
+
+        if scheduled_run:
+            scheduler_state["last_daily_run"] = local_date
+        if changes or scheduled_run:
+            _scheduler_store.save(user_id)
     except Exception as e:
         logger.error("[%s] Auto-sync error: %s", label, e)
 
@@ -925,8 +1124,12 @@ def api_status():
     books, abs_ok = [], False
     if cfg(user_id, "ABS_URL") and cfg(user_id, "ABS_TOKEN"):
         books, abs_ok = get_cached_books(user_id, scope)
-    with _last_synced_lock:
-        last = dict(_last_synced.get(user_id, {}))
+    mode = cfg(user_id, "SYNC_MODE", "frequent")
+    last = {
+        _book_state_key(book): synced_minutes
+        for book in books
+        if (synced_minutes := _last_synced_minutes(user_id, book)) is not None
+    }
     return jsonify({
         "abs_ok": abs_ok,
         "sg_ok": bool(cfg(user_id, "STORYGRAPH_SESSION")),
@@ -935,6 +1138,9 @@ def api_status():
         "poll_interval": POLL_INTERVAL,
         "sync_threshold": SYNC_THRESHOLD,
         "sync_scope": scope,
+        "sync_mode": mode,
+        "daily_sync_time": cfg(user_id, "DAILY_SYNC_TIME", DEFAULT_DAILY_SYNC_TIME),
+        "timezone": cfg(user_id, "TIMEZONE", DEFAULT_TIMEZONE),
         "books": books,
         "last_synced": last,
     })
@@ -954,10 +1160,6 @@ def api_sync():
         if not books:
             return jsonify({"message": "No books found", "synced": 0, "total": 0, "results": []})
         results = do_sync(user_id, books)
-        with _last_synced_lock:
-            last = _last_synced.setdefault(user_id, {})
-            for b in books:
-                last[_book_state_key(b)] = b["current_minutes"]
         synced = sum(1 for r in results if r["status"] == "success")
         return jsonify({"message": "Sync complete", "synced": synced, "total": len(books), "results": results})
     except Exception as e:
@@ -1272,7 +1474,10 @@ def api_logs():
 def api_settings():
     user_id = g.user["id"]
     data = request.json or {}
-    allowed = {"ABS_URL", "ABS_TOKEN", "STORYGRAPH_SESSION", "STORYGRAPH_REMEMBER_TOKEN", "SYNC_SCOPE"}
+    allowed = {
+        "ABS_URL", "ABS_TOKEN", "STORYGRAPH_SESSION", "STORYGRAPH_REMEMBER_TOKEN",
+        "SYNC_SCOPE", "SYNC_MODE", "DAILY_SYNC_TIME", "TIMEZONE",
+    }
     if "ABS_URL" in data and data["ABS_URL"]:
         parsed = urlparse(data["ABS_URL"])
         if parsed.scheme not in ("http", "https"):
@@ -1281,6 +1486,18 @@ def api_settings():
             return jsonify({"error": "ABS_URL must include a hostname"}), 400
     if data.get("SYNC_SCOPE") and data["SYNC_SCOPE"] not in SYNC_SCOPES:
         return jsonify({"error": "Invalid SYNC_SCOPE"}), 400
+    if data.get("SYNC_MODE") and data["SYNC_MODE"] not in SYNC_MODES:
+        return jsonify({"error": "Invalid SYNC_MODE"}), 400
+    if data.get("DAILY_SYNC_TIME"):
+        try:
+            _parse_daily_sync_time(data["DAILY_SYNC_TIME"])
+        except (TypeError, ValueError):
+            return jsonify({"error": "DAILY_SYNC_TIME must use HH:MM"}), 400
+    if data.get("TIMEZONE"):
+        try:
+            ZoneInfo(data["TIMEZONE"])
+        except (TypeError, ZoneInfoNotFoundError):
+            return jsonify({"error": "Invalid TIMEZONE"}), 400
     set_cfg(user_id, {k: v for k, v in data.items() if k in allowed})
     logger.info("[%s] Settings updated via UI", g.user.get("username") or g.user.get("display_name") or user_id)
     return jsonify({"ok": True})
@@ -1296,6 +1513,9 @@ def api_settings_get():
         "STORYGRAPH_SESSION": "set" if cfg(user_id, "STORYGRAPH_SESSION") else "",
         "STORYGRAPH_REMEMBER_TOKEN": "set" if cfg(user_id, "STORYGRAPH_REMEMBER_TOKEN") else "",
         "SYNC_SCOPE": cfg(user_id, "SYNC_SCOPE", "in_progress"),
+        "SYNC_MODE": cfg(user_id, "SYNC_MODE", "frequent"),
+        "DAILY_SYNC_TIME": cfg(user_id, "DAILY_SYNC_TIME", DEFAULT_DAILY_SYNC_TIME),
+        "TIMEZONE": cfg(user_id, "TIMEZONE", DEFAULT_TIMEZONE),
     })
 
 
