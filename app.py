@@ -647,19 +647,32 @@ def do_sync(user_id: str, books: list[dict]) -> list[dict]:
             status = _target_status(book)
             state_key = _book_state_key(book)
             prev = synced.get(state_key) or synced.get(book["title"])
+
+            # A manual pin is a correction, so it has to outrank the edition an
+            # earlier sync settled on — otherwise "pins this book for both Sync
+            # and Import" would only ever hold for books that hadn't synced yet,
+            # and a bad match could never be fixed. Dropping prev also defeats
+            # the unchanged check below, which is exactly right: the newly
+            # pinned edition has none of the old one's progress on it.
+            pinned = _pinned_edition_id(user_id, book.get("abs_item_id"))
+            if pinned and prev and prev.get("storygraph_book_id") != pinned:
+                logger.info(
+                    "[%s] '%s': manually pinned edition %s replaces %s",
+                    label, book["title"], pinned, prev.get("storygraph_book_id"),
+                )
+                prev = None
+
             if prev is not None and prev.get("status") == status and abs(pct - prev.get("pct", -1)) < 0.5:
                 logger.info("[%s] '%s' unchanged (%s, %.1f%%) — skipping", label, book["title"], status, pct)
                 results.append({"title": book["title"], "status": "unchanged", "progress_percent": pct})
                 continue
 
-            book_id = prev.get("storygraph_book_id") if prev else None
+            book_id = (prev.get("storygraph_book_id") if prev else None) or pinned
             if not book_id and book.get("abs_item_id"):
-                # Reuse an edition resolved via History Import (auto-matched or
-                # manually picked) before doing a fresh search — otherwise a
-                # manual pick there (e.g. for a StoryGraph split-work case a
-                # title/author search can't resolve on its own) would only
-                # ever help Import and regular sync would keep failing the
-                # same way forever.
+                # Fall back to an edition History Import auto-matched, before
+                # doing a fresh search — otherwise a match made there would only
+                # ever help Import and regular sync would keep failing the same
+                # way forever.
                 edition = _saved_edition(user_id, book["abs_item_id"])
                 if edition:
                     book_id = edition.get("storygraph_book_id")
@@ -1015,13 +1028,28 @@ def _storygraph_page_title(html: str) -> str | None:
     return re.sub(r"\s*\|\s*The StoryGraph\s*$", "", m.group(1)).strip() or None
 
 
-def _save_edition(user_id: str, item_id: str, edition: dict):
+def _save_edition(user_id: str, item_id: str, edition: dict, source: str):
     """Pin this ABS item to a StoryGraph edition, for both History Import and
     regular sync. Kept whole (not just the id) so a later preview can show what
-    was matched without re-fetching the book page."""
+    was matched without re-fetching the book page.
+
+    `source` is "manual" when a person chose the edition, which lets it override
+    an edition an earlier sync already settled on; an "auto" match only fills a
+    gap and never retargets a book that is already syncing somewhere."""
     state = _import_store.get(user_id)
-    state.setdefault(item_id, {})["edition"] = edition
+    state.setdefault(item_id, {})["edition"] = {**edition, "source": source}
     _import_store.save(user_id)
+
+
+def _pinned_edition_id(user_id: str, item_id: str | None) -> str | None:
+    """The StoryGraph book id a person explicitly chose for this ABS item — the
+    only kind that outranks whatever regular sync last used. An edition saved
+    before this field existed counts as "auto": never silently retarget a book
+    on a guess about how its edition was picked."""
+    if not item_id:
+        return None
+    edition = _saved_edition(user_id, item_id) or {}
+    return edition.get("storygraph_book_id") if edition.get("source") == "manual" else None
 
 
 @app.route("/api/history-import-preview/<item_id>")
@@ -1054,7 +1082,7 @@ def api_history_import_preview(item_id):
                 # route (and a rerun of this preview) can find it without
                 # re-searching — and so it stays fixed even if a later search
                 # would land somewhere else.
-                _save_edition(user_id, item_id, matched_edition)
+                _save_edition(user_id, item_id, matched_edition, source="auto")
             else:
                 candidates = [_edition_json(c) for c in editions if c.is_audio]
 
@@ -1062,11 +1090,15 @@ def api_history_import_preview(item_id):
         logged_dates = client.get_logged_progress_dates(storygraph_book_id) if storygraph_book_id else set()
 
         imported_days = book_state.get("imported_days", {})
-        days = [{
-            **day,
-            "already_imported": day_key(day["date"], day["end_position_minutes"]) in imported_days,
-            "already_logged_on_storygraph": day["date"] in logged_dates,
-        } for day in preview["days"]]
+        days = []
+        for day in preview["days"]:
+            key = day_key(day["date"], day["end_position_minutes"])
+            days.append({
+                **day,
+                "key": key,
+                "already_imported": key in imported_days,
+                "already_logged_on_storygraph": day["date"] in logged_dates,
+            })
 
         return jsonify({
             "book": {
@@ -1117,7 +1149,7 @@ def api_history_import_edition(item_id):
         "format": None,
         "duration_minutes": None,
         "identifier": None,
-    })
+    }, source="manual")
     return jsonify({"ok": True, "storygraph_book_id": storygraph_book_id})
 
 
@@ -1125,18 +1157,39 @@ def api_history_import_edition(item_id):
 @needs_abs_item("ABS_URL", "ABS_TOKEN", "STORYGRAPH_SESSION", writes=True)
 def api_history_import(item_id):
     """The actual write: posts one dated StoryGraph journal entry per confirmed
-    day, in chronological order, skipping anything already imported by this
-    tool or already logged on StoryGraph."""
+    checkpoint, in chronological order, skipping anything already imported by
+    this tool or already logged on StoryGraph.
+
+    The request body carries checkpoint *keys* only (history.day_key), never
+    dates or percentages. Every value written is rebuilt here from the user's
+    own Audiobookshelf sessions, so a crafted request can't invent a date or a
+    percentage ABS never reported, and can't reach the write path with a
+    malformed one. A key whose day has since shifted simply won't match the
+    rebuilt set and is reported back as a stale preview."""
     user_id = g.user["id"]
-    data = request.json or {}
-    confirmed = [d for d in (data.get("days") or []) if d.get("date")]
-    if not confirmed:
+    days = (request.json or {}).get("days")
+    requested = {k for k in days if isinstance(k, str)} if isinstance(days, list) else set()
+    if not requested:
         return jsonify({"error": "No days were confirmed for import"}), 400
 
     edition = _saved_edition(user_id, item_id)
     storygraph_book_id = (edition or {}).get("storygraph_book_id")
     if not storygraph_book_id:
         return jsonify({"error": "No StoryGraph edition has been matched or selected for this book yet"}), 400
+
+    try:
+        book = _resolve_abs_book(user_id, item_id)
+        if not book:
+            return jsonify({"error": "Audiobook metadata was incomplete"}), 422
+        sessions = get_abs_listening_sessions(user_id, item_id)
+    except req.RequestException as exc:
+        logger.warning("History import could not re-read ABS for %s: %s", item_id, exc)
+        return jsonify({"error": "Could not load listening history from Audiobookshelf"}), 502
+    checkpoints = {
+        day_key(day["date"], day["end_position_minutes"]): day
+        for day in build_history_preview(sessions, book["duration_minutes"])["days"]
+    }
+
     imported_days = _import_store.get(user_id)[item_id].setdefault("imported_days", {})
 
     label = (get_user(user_id) or {}).get("username") or user_id
@@ -1157,10 +1210,14 @@ def api_history_import(item_id):
 
     results = []
     posted = []  # entries StoryGraph gave an HTTP-success response for, pending verification
-    for entry in sorted(confirmed, key=lambda d: d["date"]):
-        date = entry["date"]
-        percent = entry.get("progress_percent")
-        key = day_key(date, entry.get("end_position_minutes"))
+    for key in sorted(requested):
+        day = checkpoints.get(key)
+        if day is None:
+            # Either the browser sent a key from a preview ABS has since moved
+            # past, or it made one up. Same answer either way.
+            results.append({"date": key.split("@", 1)[0], "status": "skipped", "reason": "stale_preview"})
+            continue
+        date, percent = day["date"], day["progress_percent"]
         if key in imported_days:
             results.append({"date": date, "status": "skipped", "reason": "already_imported"})
             continue

@@ -735,11 +735,13 @@
 
   // ── History Import ───────────────────────────────────────────────────────
 
-  let importPreview = null; // { itemId, data } for the currently open import card
+  let importPreview = null;      // { itemId, data } for the currently open import card
+  let selectedDays = new Set();  // checkpoint keys ticked for import
 
   function closeImport() {
     document.getElementById('import-card').style.display = 'none';
     importPreview = null;
+    selectedDays = new Set();
   }
 
   // Shown in both branches: an auto-match can land on the wrong StoryGraph
@@ -771,6 +773,10 @@
       const d = await (await fetch(`/api/history-import-preview/${encodeURIComponent(itemId)}`)).json();
       if (d.error) throw new Error(d.error);
       importPreview = { itemId, data: d };
+      // Clean days start ticked; anything the reconstruction flagged starts
+      // unticked, so a rewind or a suspicious jump has to be looked at and
+      // opted into rather than waved through on an irreversible write.
+      selectedDays = new Set(importableDays(d).filter(x => !x.flags?.length).map(x => x.key));
       document.getElementById('import-title').textContent = `Import History — ${d.book.title}`;
       renderImport();
     } catch (e) {
@@ -802,13 +808,18 @@
     const days = data.days || [];
     const importable = importableDays(data);
 
+    const importableKeys = new Set(importable.map(d => d.key));
     const rows = days.map(day => {
       let noteBadge;
       if (day.already_imported) noteBadge = '<span class="tag tag-ok">✓ Already imported</span>';
       else if (day.already_logged_on_storygraph) noteBadge = '<span class="tag tag-ok">✓ Already on StoryGraph</span>';
       else noteBadge = flagBadges(day.flags);
+      const box = importableKeys.has(day.key)
+        ? `<input type="checkbox" aria-label="Import ${esc(day.date)}" ${selectedDays.has(day.key) ? 'checked' : ''} onchange="toggleDay('${esc(day.key)}', this.checked)">`
+        : '';
       return `
         <tr>
+          <td>${box}</td>
           <td>${esc(day.date)}</td>
           <td>${day.end_position_minutes} min</td>
           <td>${day.progress_percent == null ? '—' : day.progress_percent + '%'}</td>
@@ -821,40 +832,62 @@
       <div class="history-note">Matched edition: <strong>${esc(edition.title || '(untitled)')}</strong>${edition.format ? ` · ${esc(edition.format)}` : ''}${edition.duration_minutes ? ` · ${edition.duration_minutes} min` : ''} — <a href="https://app.thestorygraph.com/books/${encodeURIComponent(edition.storygraph_book_id)}" target="_blank" rel="noopener">verify on StoryGraph ↗</a></div>
       <div class="history-table-wrap" style="margin-top:0.75rem">
         <table class="history-table">
-          <thead><tr><th>Date</th><th>Position</th><th>Progress</th><th>Status</th></tr></thead>
-          <tbody>${rows || '<tr><td colspan="4">No usable sessions found.</td></tr>'}</tbody>
+          <thead><tr><th></th><th>Date</th><th>Position</th><th>Progress</th><th>Status</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="5">No usable sessions found.</td></tr>'}</tbody>
         </table>
       </div>
+      ${importable.length ? `<div class="text-dim" style="margin-top:0.5rem">
+        <a href="#" onclick="setAllDays(true); return false">Select all</a> ·
+        <a href="#" onclick="setAllDays(false); return false">Select none</a>
+        — flagged days start unticked; review them before including one.
+      </div>` : ''}
       ${editionOverrideField(itemId, 'Wrong edition? Paste the right StoryGraph book URL or id')}
       <div id="import-review" style="margin-top:1rem"></div>
-      <div class="history-note" style="margin-top:1rem">${importNote(importable.length)}</div>
+      <div class="history-note" id="import-note" style="margin-top:1rem">${importNote(selectedDays.size)}</div>
       <div style="margin-top:0.75rem">
-        <button class="btn btn-primary" ${importable.length && !readOnlyMode ? '' : 'disabled'} onclick="confirmImport()">Confirm &amp; Import ${importable.length} ${importable.length === 1 ? 'entry' : 'entries'}</button>
+        <button class="btn btn-primary" id="import-confirm" ${selectedDays.size && !readOnlyMode ? '' : 'disabled'} onclick="confirmImport()">${confirmLabel(selectedDays.size)}</button>
       </div>`;
+  }
+
+  function confirmLabel(count) {
+    return `Confirm & Import ${count} ${count === 1 ? 'entry' : 'entries'}`;
+  }
+
+  // Patch the button and note in place rather than re-rendering: a full
+  // re-render on every tick would drop the checkbox the user just clicked.
+  function toggleDay(key, on) {
+    if (on) selectedDays.add(key); else selectedDays.delete(key);
+    const btn = document.getElementById('import-confirm');
+    if (btn) {
+      btn.disabled = !selectedDays.size || readOnlyMode;
+      btn.textContent = confirmLabel(selectedDays.size);
+    }
+    const note = document.getElementById('import-note');
+    if (note) note.textContent = importNote(selectedDays.size);
+  }
+
+  function setAllDays(on) {
+    selectedDays = on ? new Set(importableDays(importPreview.data).map(d => d.key)) : new Set();
+    renderImport();
   }
 
   function importNote(count) {
     if (readOnlyMode) return 'Read-only development mode — importing is disabled.';
-    if (!count) return 'Nothing new to import — every day above is already imported or already on StoryGraph.';
+    if (!count) return 'Nothing selected — tick the days above to import them.';
     return `Writing ${count} new dated entr${count === 1 ? 'y' : 'ies'} can't be undone automatically — you'd need to delete them by hand on StoryGraph afterward.`;
   }
 
   async function confirmImport() {
-    const { itemId, data } = importPreview;
-    const days = importableDays(data);
+    const { itemId } = importPreview;
     const review = document.getElementById('import-review');
     review.innerHTML = '<div class="empty-state">Writing to StoryGraph…</div>';
     try {
       const r = await fetch(`/api/history-import/${encodeURIComponent(itemId)}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          days: days.map(d => ({
-            date: d.date,
-            end_position_minutes: d.end_position_minutes,
-            progress_percent: d.progress_percent,
-          })),
-        }),
+        // Keys only — the server rebuilds each checkpoint's date and
+        // percentage from Audiobookshelf before writing anything.
+        body: JSON.stringify({ days: [...selectedDays] }),
       });
       const result = await r.json();
       if (result.error) throw new Error(result.error);
