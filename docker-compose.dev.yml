@@ -1,0 +1,12 @@
+services:
+  abs-storygraph-sync:
+    command: ["flask", "--app", "app", "run", "--host=0.0.0.0", "--port=5465", "--reload"]
+    environment:
+      READ_ONLY: "true"
+    volumes:
+      - ./app.py:/app/app.py
+      - ./matcher.py:/app/matcher.py
+      - ./history.py:/app/history.py
+      - ./journal.py:/app/journal.py
+      - ./templates:/app/templates
+      - ./data:/app/data

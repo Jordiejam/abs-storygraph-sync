@@ -215,6 +215,48 @@
       padding-top: 0.625rem;
     }
 
+    .book-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+
+    .history-summary {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+      gap: 0.75rem;
+      margin-bottom: 1rem;
+    }
+    .history-stat {
+      padding: 0.75rem;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+    .history-stat strong { display: block; font-size: 1rem; }
+    .history-stat span { color: var(--text-muted); font-size: 0.68rem; }
+    .history-stat.confidence-high strong { color: var(--green); }
+    .history-stat.confidence-review strong { color: var(--yellow); }
+    .history-stat.confidence-insufficient strong { color: var(--text-dim); }
+    .history-table-wrap { overflow-x: auto; }
+    .history-table { width: 100%; border-collapse: collapse; font-size: 0.76rem; }
+    .history-table th, .history-table td {
+      padding: 0.6rem 0.7rem;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    .history-table th { color: var(--text-muted); font-weight: 600; }
+    .history-note { color: var(--text-muted); font-size: 0.72rem; margin-top: 0.75rem; }
+    .history-callouts { display: flex; flex-direction: column; gap: 0.4rem; margin-bottom: 1rem; }
+    .history-callouts .history-note { margin-top: 0; }
+    .tag {
+      display: inline-block;
+      padding: 0.15rem 0.5rem;
+      border-radius: 100px;
+      font-size: 0.7rem;
+      font-weight: 500;
+      white-space: nowrap;
+    }
+    .tag-ok { color: var(--green); background: rgba(52, 211, 153, 0.1); }
+    .tag-warn { color: var(--yellow); background: rgba(251, 191, 36, 0.1); margin-right: 0.3rem; }
+
     .empty-state {
       color: var(--text-muted);
       font-size: 0.875rem;
@@ -365,9 +407,23 @@
     .badge.failed  { background: #2a0d0d; color: var(--red); }
     .badge.not_found { background: #1a1a0d; color: var(--yellow); }
     .badge.error   { background: #2a0d0d; color: var(--red); }
+    .badge.skipped { background: #1a1a0d; color: var(--text-dim); }
 
     .result-title { font-weight: 500; flex: 1; }
     .result-pct   { color: var(--text-dim); font-size: 0.72rem; }
+    .text-dim { color: var(--text-dim); font-size: 0.8rem; }
+
+    .edition-candidates { display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.75rem; }
+    .edition-candidate {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      padding: 0.75rem;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
 
     /* ── Toast ── */
     #toast {
@@ -422,6 +478,22 @@
       <div class="empty-state">Loading…</div>
     </div>
     <div class="sync-result" id="sync-result"></div>
+  </div>
+
+  <div class="card" id="history-card" style="display:none">
+    <div class="section-header">
+      <h2 id="history-title">History Preview</h2>
+      <button class="btn btn-ghost" onclick="closeHistory()">Close</button>
+    </div>
+    <div id="history-content"></div>
+  </div>
+
+  <div class="card" id="import-card" style="display:none">
+    <div class="section-header">
+      <h2 id="import-title">Import History</h2>
+      <button class="btn btn-ghost" onclick="closeImport()">Close</button>
+    </div>
+    <div id="import-content"></div>
   </div>
 
   <!-- Settings -->
@@ -523,6 +595,7 @@
   let timer;
   let shownLogs = 0;
   let selectedScope = 'in_progress';
+  let readOnlyMode = false;
 
   const SCOPE_HEADERS = {
     in_progress: 'Currently Listening',
@@ -545,7 +618,10 @@
 
       setDot('d-abs', 'l-abs', d.abs_ok, 'ABS');
       setDot('d-sg',  'l-sg',  d.sg_ok,  'StoryGraph');
-      document.getElementById('l-poll').textContent = `Every ${d.poll_interval}s`;
+      readOnlyMode = Boolean(d.read_only);
+      document.getElementById('l-poll').textContent = readOnlyMode ? 'Read-only dev' : `Every ${d.poll_interval}s`;
+      document.getElementById('sync-btn').disabled = readOnlyMode;
+      document.getElementById('sync-label').textContent = readOnlyMode ? 'Read-only mode' : 'Sync Now';
       document.getElementById('books-header').textContent = SCOPE_HEADERS[d.sync_scope] || 'Currently Listening';
 
       const grid = document.getElementById('books-grid');
@@ -554,7 +630,7 @@
         return;
       }
       grid.innerHTML = d.books.map(b => {
-        const synced = d.last_synced[b.title];
+        const synced = d.last_synced[b.state_key];
         const syncedLabel = synced != null
           ? `Last synced at ${synced} min (${b.progress_percent}%)`
           : 'Not yet synced this session';
@@ -573,10 +649,280 @@
                 <span>${b.current_minutes} / ${b.duration_minutes} min</span>
               </div>
             </div>
-            <div class="last-sync">${esc(syncedLabel)}</div>
-          </div>`;
+          <div class="last-sync">${esc(syncedLabel)}</div>
+          <div class="book-actions">
+            <button class="btn btn-ghost" onclick="previewHistory('${b.abs_item_id}')">Preview history</button>
+            <button class="btn btn-ghost" onclick="openImport('${b.abs_item_id}')">Import History</button>
+          </div>
+        </div>`;
       }).join('');
     } catch(e) {}
+  }
+
+  const CONFIDENCE_INFO = {
+    high: { label: 'High', text: 'Sessions line up cleanly and the furthest position moved forward steadily — this looks safe to trust.' },
+    review: { label: 'Needs a look', text: 'A few days show rewinds, re-listening, or no forward progress. Worth skimming the flagged rows below before importing anything.' },
+    insufficient: { label: 'Insufficient', text: 'Not enough usable session data (or a missing book runtime) to reconstruct daily progress yet.' },
+  };
+
+  const FLAG_INFO = {
+    rewind_or_relisten: 'Rewound / re-listened',
+    no_new_progress: 'No forward progress',
+    gap: 'Long gap before this session',
+    large_jump: 'Jumped ahead — check for skipped material',
+  };
+
+  function flagBadges(flags) {
+    if (!flags || !flags.length) return '<span class="tag tag-ok">✓ On track</span>';
+    return flags.map(f => `<span class="tag tag-warn">${esc(FLAG_INFO[f] || f)}</span>`).join('');
+  }
+
+  async function previewHistory(itemId) {
+    const card = document.getElementById('history-card');
+    const content = document.getElementById('history-content');
+    card.style.display = 'block';
+    content.innerHTML = '<div class="empty-state">Loading ABS listening sessions…</div>';
+    card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    try {
+      const d = await (await fetch(`/api/history-preview/${encodeURIComponent(itemId)}`)).json();
+      if (d.error) throw new Error(d.error);
+      document.getElementById('history-title').textContent = `History Preview — ${d.book.title}`;
+      const s = d.summary;
+      const rows = (d.days || []).map(day => `
+        <tr>
+          <td>${esc(day.date)}</td>
+          <td>${day.session_count}</td>
+          <td>${day.listening_minutes} min</td>
+          <td>${day.end_position_minutes} min</td>
+          <td>${day.progress_percent == null ? '—' : day.progress_percent + '%'}</td>
+          <td>${flagBadges(day.flags)}</td>
+        </tr>`).join('');
+
+      const ci = CONFIDENCE_INFO[s.confidence] || { label: s.confidence, text: '' };
+
+      const callouts = [];
+      if (s.skipped_session_count) {
+        callouts.push(`⚠ ${s.skipped_session_count} session${s.skipped_session_count === 1 ? '' : 's'} skipped — Audiobookshelf didn't include a usable date or position, so ${s.skipped_session_count === 1 ? 'it isn\'t' : 'they aren\'t'} counted above.`);
+      }
+      const gap = Math.round((s.total_listening_minutes - (s.latest_position_minutes || 0)) * 10) / 10;
+      if (gap > 1) {
+        callouts.push(`ℹ You listened to ${s.total_listening_minutes} min in total, but the furthest position only reached ${s.latest_position_minutes} min. The ${gap} min gap is most likely rewinds or re-listening to earlier parts, not lost progress.`);
+      }
+
+      content.innerHTML = `
+        <div class="history-summary">
+          <div class="history-stat"><strong>${s.session_count}</strong><span>ABS sessions</span></div>
+          <div class="history-stat"><strong>${s.day_count}</strong><span>Listening days</span></div>
+          <div class="history-stat"><strong>${s.total_listening_minutes} min</strong><span>Time listened</span></div>
+          <div class="history-stat confidence-${esc(s.confidence)}"><strong>${esc(ci.label)}</strong><span>Preview confidence</span></div>
+        </div>
+        ${ci.text ? `<div class="history-callouts"><p class="history-note">${esc(ci.text)}</p>${callouts.map(c => `<p class="history-note">${esc(c)}</p>`).join('')}</div>` : ''}
+        <div class="history-table-wrap">
+          <table class="history-table">
+            <thead><tr><th>Date</th><th>Sessions</th><th>Listened</th><th>End position</th><th>Progress</th><th>Notes</th></tr></thead>
+            <tbody>${rows || '<tr><td colspan="6">No usable sessions found.</td></tr>'}</tbody>
+          </table>
+        </div>
+        <div class="history-note">Read-only preview. Nothing on this screen is sent to StoryGraph.</div>`;
+    } catch (e) {
+      content.innerHTML = `<div class="empty-state">${esc(e.message || 'Could not load history')}</div>`;
+    }
+  }
+
+  function closeHistory() {
+    document.getElementById('history-card').style.display = 'none';
+  }
+
+  // ── History Import ───────────────────────────────────────────────────────
+
+  let importPreview = null;      // { itemId, data } for the currently open import card
+  let selectedDays = new Set();  // checkpoint keys ticked for import
+
+  function closeImport() {
+    document.getElementById('import-card').style.display = 'none';
+    importPreview = null;
+    selectedDays = new Set();
+  }
+
+  // Shown in both branches: an auto-match can land on the wrong StoryGraph
+  // work just as easily as it can fail outright, so the override has to be
+  // reachable even once an edition is already matched.
+  function editionOverrideField(itemId, label) {
+    return `
+      <div class="field" style="margin-top:1rem">
+        <label>${label}</label>
+        <div class="input-row">
+          <input type="text" id="manual-edition-url" placeholder="https://app.thestorygraph.com/books/...">
+          <button class="btn btn-ghost" onclick="submitManualEdition('${itemId}')">Use this</button>
+        </div>
+        <span class="hint">Pins this book to that edition for both Sync and Import History — useful when a title search lands on the wrong StoryGraph work (e.g. a split-up dramatized adaptation).</span>
+      </div>`;
+  }
+
+  function importableDays(data) {
+    return (data.days || []).filter(d => d.progress_percent != null && !d.already_imported && !d.already_logged_on_storygraph);
+  }
+
+  async function openImport(itemId) {
+    const card = document.getElementById('import-card');
+    const content = document.getElementById('import-content');
+    card.style.display = 'block';
+    content.innerHTML = '<div class="empty-state">Loading ABS listening sessions and matching a StoryGraph edition…</div>';
+    card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    try {
+      const d = await (await fetch(`/api/history-import-preview/${encodeURIComponent(itemId)}`)).json();
+      if (d.error) throw new Error(d.error);
+      importPreview = { itemId, data: d };
+      // Clean days start ticked; anything the reconstruction flagged starts
+      // unticked, so a rewind or a suspicious jump has to be looked at and
+      // opted into rather than waved through on an irreversible write.
+      selectedDays = new Set(importableDays(d).filter(x => !x.flags?.length).map(x => x.key));
+      document.getElementById('import-title').textContent = `Import History — ${d.book.title}`;
+      renderImport();
+    } catch (e) {
+      content.innerHTML = `<div class="empty-state">${esc(e.message || 'Could not load import preview')}</div>`;
+    }
+  }
+
+  function renderImport() {
+    const { itemId, data } = importPreview;
+    const content = document.getElementById('import-content');
+
+    if (!data.matched_edition) {
+      const candidateRows = (data.candidates || []).map(c => `
+        <div class="edition-candidate">
+          <div>
+            <strong>${esc(c.title)}</strong><br>
+            <span class="text-dim">${esc(c.format || '')}${c.duration_minutes ? ` · ${c.duration_minutes} min` : ''}${c.identifier ? ` · ${esc(c.identifier)}` : ''}</span>
+          </div>
+          <button class="btn btn-ghost" onclick="postEditionChoice('${itemId}', '${c.storygraph_book_id}')">Use this edition</button>
+        </div>`).join('');
+
+      content.innerHTML = `
+        <div class="history-note">Couldn't confidently match a StoryGraph audio edition for this book — nothing can be imported until one is selected. StoryGraph sometimes splits dramatized adaptations into separate "1 of 2" / "2 of 2" listings, which this can't guess between safely.</div>
+        ${candidateRows ? `<div class="edition-candidates">${candidateRows}</div>` : '<div class="history-note" style="margin-top:0.75rem">No audio editions turned up in the search either.</div>'}
+        ${editionOverrideField(itemId, 'Or paste a StoryGraph book URL or id')}`;
+      return;
+    }
+
+    const days = data.days || [];
+    const importable = importableDays(data);
+
+    const importableKeys = new Set(importable.map(d => d.key));
+    const rows = days.map(day => {
+      let noteBadge;
+      if (day.already_imported) noteBadge = '<span class="tag tag-ok">✓ Already imported</span>';
+      else if (day.already_logged_on_storygraph) noteBadge = '<span class="tag tag-ok">✓ Already on StoryGraph</span>';
+      else noteBadge = flagBadges(day.flags);
+      const box = importableKeys.has(day.key)
+        ? `<input type="checkbox" aria-label="Import ${esc(day.date)}" ${selectedDays.has(day.key) ? 'checked' : ''} onchange="toggleDay('${esc(day.key)}', this.checked)">`
+        : '';
+      return `
+        <tr>
+          <td>${box}</td>
+          <td>${esc(day.date)}</td>
+          <td>${day.end_position_minutes} min</td>
+          <td>${day.progress_percent == null ? '—' : day.progress_percent + '%'}</td>
+          <td>${noteBadge}</td>
+        </tr>`;
+    }).join('');
+
+    const edition = data.matched_edition;
+    content.innerHTML = `
+      <div class="history-note">Matched edition: <strong>${esc(edition.title || '(untitled)')}</strong>${edition.format ? ` · ${esc(edition.format)}` : ''}${edition.duration_minutes ? ` · ${edition.duration_minutes} min` : ''} — <a href="https://app.thestorygraph.com/books/${encodeURIComponent(edition.storygraph_book_id)}" target="_blank" rel="noopener">verify on StoryGraph ↗</a></div>
+      <div class="history-table-wrap" style="margin-top:0.75rem">
+        <table class="history-table">
+          <thead><tr><th></th><th>Date</th><th>Position</th><th>Progress</th><th>Status</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="5">No usable sessions found.</td></tr>'}</tbody>
+        </table>
+      </div>
+      ${importable.length ? `<div class="text-dim" style="margin-top:0.5rem">
+        <a href="#" onclick="setAllDays(true); return false">Select all</a> ·
+        <a href="#" onclick="setAllDays(false); return false">Select none</a>
+        — flagged days start unticked; review them before including one.
+      </div>` : ''}
+      ${editionOverrideField(itemId, 'Wrong edition? Paste the right StoryGraph book URL or id')}
+      <div id="import-review" style="margin-top:1rem"></div>
+      <div class="history-note" id="import-note" style="margin-top:1rem">${importNote(selectedDays.size)}</div>
+      <div style="margin-top:0.75rem">
+        <button class="btn btn-primary" id="import-confirm" ${selectedDays.size && !readOnlyMode ? '' : 'disabled'} onclick="confirmImport()">${confirmLabel(selectedDays.size)}</button>
+      </div>`;
+  }
+
+  function confirmLabel(count) {
+    return `Confirm & Import ${count} ${count === 1 ? 'entry' : 'entries'}`;
+  }
+
+  // Patch the button and note in place rather than re-rendering: a full
+  // re-render on every tick would drop the checkbox the user just clicked.
+  function toggleDay(key, on) {
+    if (on) selectedDays.add(key); else selectedDays.delete(key);
+    const btn = document.getElementById('import-confirm');
+    if (btn) {
+      btn.disabled = !selectedDays.size || readOnlyMode;
+      btn.textContent = confirmLabel(selectedDays.size);
+    }
+    const note = document.getElementById('import-note');
+    if (note) note.textContent = importNote(selectedDays.size);
+  }
+
+  function setAllDays(on) {
+    selectedDays = on ? new Set(importableDays(importPreview.data).map(d => d.key)) : new Set();
+    renderImport();
+  }
+
+  function importNote(count) {
+    if (readOnlyMode) return 'Read-only development mode — importing is disabled.';
+    if (!count) return 'Nothing selected — tick the days above to import them.';
+    return `Writing ${count} new dated entr${count === 1 ? 'y' : 'ies'} can't be undone automatically — you'd need to delete them by hand on StoryGraph afterward.`;
+  }
+
+  async function confirmImport() {
+    const { itemId } = importPreview;
+    const review = document.getElementById('import-review');
+    review.innerHTML = '<div class="empty-state">Writing to StoryGraph…</div>';
+    try {
+      const r = await fetch(`/api/history-import/${encodeURIComponent(itemId)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        // Keys only — the server rebuilds each checkpoint's date and
+        // percentage from Audiobookshelf before writing anything.
+        body: JSON.stringify({ days: [...selectedDays] }),
+      });
+      const result = await r.json();
+      if (result.error) throw new Error(result.error);
+      const rows = (result.results || []).map(res => `
+        <div class="result-row">
+          <span class="badge ${esc(res.status)}">${esc(res.status.replace('_', ' '))}</span>
+          <span class="result-title">${esc(res.date)}</span>
+          ${res.reason ? `<span class="text-dim">${esc(res.reason.replace(/_/g, ' '))}</span>` : ''}
+        </div>`).join('');
+      review.innerHTML = `<div class="history-note">Imported ${result.imported} of ${result.total}. Re-open Import History to see updated status.</div>${rows}`;
+    } catch (e) {
+      review.innerHTML = `<div class="empty-state">${esc(e.message || 'Import failed')}</div>`;
+    }
+  }
+
+  async function submitManualEdition(itemId) {
+    const input = document.getElementById('manual-edition-url');
+    await postEditionChoice(itemId, input.value.trim());
+  }
+
+  async function postEditionChoice(itemId, storygraphBookId) {
+    const content = document.getElementById('import-content');
+    content.innerHTML = '<div class="empty-state">Checking that edition…</div>';
+    try {
+      const r = await fetch(`/api/history-import-edition/${encodeURIComponent(itemId)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ storygraph_book_id: storygraphBookId }),
+      });
+      const result = await r.json();
+      if (result.error) throw new Error(result.error);
+      openImport(itemId);
+    } catch (e) {
+      content.innerHTML = `<div class="empty-state">${esc(e.message || 'Could not use that edition')}</div>`;
+    }
   }
 
   function setDot(dotId, lblId, ok, label) {
@@ -612,8 +958,8 @@
     } catch(e) {
       toast('Sync request failed', 'err');
     } finally {
-      btn.disabled = false;
-      lbl.textContent = 'Sync Now';
+      btn.disabled = readOnlyMode;
+      lbl.textContent = readOnlyMode ? 'Read-only mode' : 'Sync Now';
     }
   }
 
@@ -658,12 +1004,14 @@
       const msg = document.getElementById('save-msg');
       msg.classList.add('show');
       setTimeout(() => msg.classList.remove('show'), 4000);
-      // Clear fields after save
+      // Clear fields after save; re-derive "(already set)" per field from the
+      // backend instead of assuming every field got a value this submission
       ['s-abs-token','s-sg-session','s-sg-remember'].forEach(id => {
         document.getElementById(id).value = '';
-        document.getElementById(id).placeholder = '(already set)';
-        document.getElementById(id).classList.add('is-set');
+        document.getElementById(id).placeholder = '••••••••';
+        document.getElementById(id).classList.remove('is-set');
       });
+      await loadSettings();
       fetchStatus();
     }
   }

@@ -12,18 +12,29 @@ Runs as a lightweight Docker container alongside ABS. No browser automation — 
 - Configurable sync scope: just in-progress books, in-progress + finished, or your entire library
 - Web UI to manage credentials, view logs, and trigger a manual sync
 - Progress is only pushed to StoryGraph when it actually changes (no duplicate journal entries)
+- Matches the closest audiobook edition using ISBN/ASIN when available and the ABS runtime
+- Read-only daily history preview reconstructed from Audiobookshelf playback sessions
 - Accounts, settings, and sync state persist across restarts
 
 ## Setup
 
 ### 1. Run with Docker Compose
 
+Clone this fork and check out the edition-aware matcher branch:
+
+```sh
+git clone --branch feature/edition-aware-matcher https://github.com/Jordiejam/abs-storygraph-sync.git
+cd abs-storygraph-sync
+```
+
 ```yaml
 services:
   abs-storygraph-sync:
-    image: ghcr.io/dukko/abs-storygraph-sync:latest
+    build: .
+    image: abs-storygraph-sync:local
     restart: unless-stopped
-    network_mode: host
+    ports:
+      - "${WEB_PORT:-5465}:5465"
     volumes:
       - ./data:/app/data
     environment:
@@ -35,10 +46,38 @@ services:
 ```
 
 ```sh
-docker compose up -d
+docker compose up -d --build
 ```
 
 Open **http://your-server:5465** — the first visit prompts you to create an account, which becomes an admin. Admins can add more local accounts from the **Users** panel; anyone who signs in via SSO gets an account automatically on first login.
+
+The ABS URL depends on how the two services can reach each other:
+
+| Setup | Example ABS URL |
+|---|---|
+| Same Docker network | `http://audiobookshelf:80` |
+| Docker Desktop, using ABS's published port | `http://host.docker.internal:13378` |
+| ABS elsewhere on your LAN | `http://192.168.1.20:13378` |
+| Public/reverse-proxied ABS | `https://abs.example.com` |
+
+Use the actual Audiobookshelf service name, internal port, host address, and
+published port from your deployment. Normal bridge networking and a published
+web port are used so the sync service works across Linux and Docker Desktop.
+
+### Development mode
+
+For local development, layer the development override onto the normal Compose
+file:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+```
+
+Python files and templates are bind-mounted into the container and Flask
+reloads them when they change, so routine source changes only need a `git pull`,
+not an image rebuild. Development mode is explicitly read-only: the background
+poller is stopped and the manual sync endpoint is blocked. Rebuild only after a
+dependency or Dockerfile change.
 
 ### 2. Get your ABS API token
 
@@ -94,8 +133,10 @@ Each user picks how much of their library to sync, in **Settings**:
 
 1. Every `POLL_INTERVAL` seconds, fetches each user's books from the ABS API (scoped per their Sync Scope setting)
 2. If any book has gained `SYNC_THRESHOLD_MINUTES` or more minutes since the last check, or has just been finished, it triggers a sync
-3. For each book to sync, searches StoryGraph by title/author, sets its status (to-read / currently-reading / read), and updates the progress percentage
+3. For each book to sync, searches StoryGraph by title/author, inspects that work's editions, and selects an audio edition by exact ISBN/ASIN or closest runtime
 4. Progress/status is only pushed if it actually changed since the last successful sync, preventing duplicate reading journal entries
+
+If no audio edition is within a conservative runtime tolerance, the sync leaves the book untouched rather than risk writing progress to the wrong edition. Successful edition choices are persisted against the stable Audiobookshelf item ID and reused on later syncs.
 
 StoryGraph has no public API — this tool uses session cookies to make the same requests the website does.
 
