@@ -8,7 +8,7 @@ Runs as a lightweight Docker container alongside ABS. No browser automation — 
 
 - Multi-user: everyone gets their own account, ABS/StoryGraph credentials, and sync state
 - Login via local username/password, or SSO through any OIDC provider (e.g. [PocketID](https://github.com/pocket-id/pocket-id))
-- Configurable auto-sync frequency: every 10 minutes, or once daily at a chosen local time
+- Configurable auto-sync frequency: every 10 minutes, or a daily history reconciliation at a chosen local time
 - Book starts and finishes sync promptly even when ordinary progress is set to daily
 - Configurable sync scope: just in-progress books, in-progress + finished, or your entire library
 - Web UI to manage credentials, view logs, and trigger a manual sync
@@ -135,14 +135,14 @@ Each user picks how much of their library to sync, in **Settings**:
 Each user can choose:
 
 - **Every 10 Minutes** (default) — progress is pushed after at least `SYNC_THRESHOLD_MINUTES` of additional listening
-- **Daily** — ordinary progress is pushed once per day at the selected local time, which defaults to midnight (`00:00`)
+- **Daily** — at the selected local time (midnight by default), completed Audiobookshelf listening days are reconciled to dated StoryGraph progress entries
 
-The app still checks Audiobookshelf every `POLL_INTERVAL` seconds in Daily mode, but only contacts StoryGraph when a book starts, a book finishes, the daily run is due, or the user selects **Sync Now**. The first check after enabling this version quietly records existing books so old starts and finishes are not replayed.
+The app still checks Audiobookshelf every `POLL_INTERVAL` seconds in Daily mode, but only contacts StoryGraph when a book starts, a book finishes, the daily run is due, or the user selects **Sync Now**. At midnight, it reconciles the previous day's ABS checkpoint using the same duplicate-safe, verified write path as History Import, so the entry keeps the day the listening happened. After downtime it catches up missed completed days; the first daily run only considers yesterday and never sweeps older history automatically. Finished books are retained until that final listening day has been checked. The first check after enabling this version quietly records existing books so old starts and finishes are not replayed.
 
 ## How it works
 
 1. Every `POLL_INTERVAL` seconds, fetches one lightweight ABS progress snapshot per user
-2. Starts and finishes sync promptly; ordinary progress follows that user's frequent or daily setting
+2. Starts and finishes sync promptly; frequent mode pushes changed progress, while daily mode reconciles completed listening days from ABS history
 3. For each book to sync, searches StoryGraph by title/author, inspects that work's editions, and selects an audio edition by exact ISBN/ASIN or closest runtime
 4. Progress/status is only pushed if it actually changed since the last successful sync, preventing duplicate reading journal entries
 

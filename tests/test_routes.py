@@ -198,6 +198,55 @@ class ImportPreviewTests(_ImportRouteCase):
 
 
 class ImportWriteTests(_ImportRouteCase):
+    def test_status_only_sync_does_not_create_an_undated_progress_entry(self):
+        user_id = self.user["id"]
+        A._sync_store.get(user_id)[self.ITEM] = {
+            "pct": 10.0,
+            "status": "currently-reading",
+            "storygraph_book_id": AUDIO.book_id,
+        }
+        client = FakeStoryGraph()
+
+        result = A.do_sync(
+            user_id,
+            [dict(self.book)],
+            write_progress=False,
+            client=client,
+        )
+
+        self.assertEqual("success", result[0]["status"])
+        self.assertEqual([], [call for call in client.calls if call[0] == "write"])
+
+    def test_daily_sync_reuses_import_state_and_only_reconciles_its_date_range(self):
+        user_id = self.user["id"]
+        A._sync_store.get(user_id)[self.ITEM] = {
+            "pct": 30.0,
+            "status": "currently-reading",
+            "storygraph_book_id": AUDIO.book_id,
+        }
+        client = FakeStoryGraph()
+
+        ok = A._daily_history_sync(
+            user_id,
+            [dict(self.book)],
+            A.date_cls.fromisoformat("2026-01-06"),
+            A.date_cls.fromisoformat("2026-01-06"),
+            client,
+            "jordan",
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(
+            [("write", "2026-01-06", 20.0)],
+            [call for call in client.calls if call[0] == "write"],
+        )
+        imported_keys = self.stored()["imported_days"]
+        self.assertEqual(["2026-01-06@120.0"], list(imported_keys))
+
+        body = self.do_import(self.all_keys()).get_json()
+        self.assertEqual("already_imported", self.reasons(body)["2026-01-06"])
+        self.assertEqual(2, body["imported"])
+
     def test_imports_every_confirmed_day_including_the_ensure_status_day(self):
         keys = self.all_keys()
         body = self.do_import(keys).get_json()

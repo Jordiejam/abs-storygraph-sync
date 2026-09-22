@@ -545,12 +545,12 @@
             <button type="button" class="btn btn-ghost mode-btn" data-mode="frequent">Every 10 Minutes</button>
             <button type="button" class="btn btn-ghost mode-btn" data-mode="daily">Daily</button>
           </div>
-          <span class="hint">Daily mode still syncs book starts and finishes within one polling interval.</span>
+          <span class="hint">Daily mode reconciles completed listening days using History Import's dated, duplicate-safe writes. Starts and finishes still sync within one polling interval.</span>
         </div>
         <div class="field" id="daily-time-field" style="display:none">
           <label for="s-daily-time">Daily Sync Time</label>
           <input type="time" id="s-daily-time" value="00:00">
-          <span class="hint" id="timezone-hint">Uses your local timezone.</span>
+          <span class="hint" id="timezone-hint">Uses your local timezone; midnight reconciles the day that just ended.</span>
         </div>
       </div>
       <div class="form-footer">
