@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 from functools import wraps
 import os, re, json, logging, threading, time, uuid
 from collections import deque
-from datetime import datetime, timezone, time as datetime_time
+from datetime import date as date_cls, datetime, timezone, time as datetime_time, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import requests as req
 from bs4 import BeautifulSoup
@@ -679,10 +679,15 @@ def do_sync(
     user_id: str,
     books: list[dict],
     start_before_finish: set[str] | None = None,
+    write_progress: bool = True,
+    client: StoryGraphClient | None = None,
 ) -> list[dict]:
     user = get_user(user_id)
     label = (user or {}).get("username") or (user or {}).get("display_name") or user_id
-    client = StoryGraphClient(cfg(user_id, "STORYGRAPH_SESSION"), cfg(user_id, "STORYGRAPH_REMEMBER_TOKEN"))
+    client = client or StoryGraphClient(
+        cfg(user_id, "STORYGRAPH_SESSION"),
+        cfg(user_id, "STORYGRAPH_REMEMBER_TOKEN"),
+    )
     if not client.check_auth():
         logger.error("[%s] StoryGraph session invalid — update STORYGRAPH_SESSION", label)
         return [{"title": b["title"], "status": "auth_error"} for b in books]
@@ -755,6 +760,14 @@ def do_sync(
                     continue
 
             ok, already_matched, status_html = client.ensure_status(book_id, status)
+            if not ok:
+                results.append({
+                    "title": book["title"],
+                    "status": "failed",
+                    "progress_percent": pct,
+                    "current_minutes": book["current_minutes"],
+                })
+                continue
             target_pct = 100 if status == "read" else pct
             # Skip the progress POST when StoryGraph already agrees with us. "read" is
             # always 100% by definition, so an already-matched read status is always
@@ -774,7 +787,7 @@ def do_sync(
                 already_matched
                 and (status == "read" or (current_pct is not None and abs(current_pct - target_pct) < 0.5))
             )
-            if not skip_progress:
+            if write_progress and not skip_progress:
                 ok = client.update_progress(book_id, target_pct, html=status_html)
             if ok:
                 synced[state_key] = {
@@ -871,6 +884,187 @@ def _frequent_sync_candidates(user_id: str, books: list[dict]) -> list[dict]:
     return candidates
 
 
+def _history_checkpoints(
+    sessions: list[dict],
+    duration_minutes: float,
+    start_date: date_cls | None = None,
+    end_date: date_cls | None = None,
+) -> dict[str, dict]:
+    """Rebuild trusted ABS checkpoints, optionally limited to a date range."""
+    checkpoints = {}
+    for day in build_history_preview(sessions, duration_minutes)["days"]:
+        checkpoint_date = date_cls.fromisoformat(day["date"])
+        if start_date and checkpoint_date < start_date:
+            continue
+        if end_date and checkpoint_date > end_date:
+            continue
+        checkpoints[day_key(day["date"], day["end_position_minutes"])] = day
+    return checkpoints
+
+
+class HistoryReconcileError(Exception):
+    """A book-level precondition failed before dated writes could be checked."""
+
+
+def _reconcile_history_checkpoints(
+    user_id: str,
+    item_id: str,
+    storygraph_book_id: str,
+    checkpoints: dict[str, dict],
+    requested: set[str],
+    client: StoryGraphClient,
+    label: str,
+    ensure_read_status: bool = True,
+) -> list[dict]:
+    """Write and verify trusted daily checkpoints for manual and daily sync.
+
+    `requested` contains checkpoint keys, never caller-supplied dates or
+    percentages. Both call sites therefore share exactly the same duplicate
+    checks, durable import state, write path, and post-write verification.
+    """
+    if ensure_read_status:
+        status_ok, _, _ = client.ensure_status(storygraph_book_id, "currently-reading")
+        if not status_ok:
+            raise HistoryReconcileError(
+                "Could not set this book to 'currently reading' on StoryGraph, "
+                "which a dated entry needs to attach to"
+            )
+
+    already_logged = client.get_logged_progress_dates(storygraph_book_id)
+    item_state = _import_store.get(user_id).setdefault(item_id, {})
+    imported_days = item_state.setdefault("imported_days", {})
+    results = []
+    posted = []
+
+    for key in sorted(requested):
+        day = checkpoints.get(key)
+        if day is None:
+            results.append({
+                "date": key.split("@", 1)[0],
+                "status": "skipped",
+                "reason": "stale_preview",
+            })
+            continue
+        checkpoint_date, percent = day["date"], day["progress_percent"]
+        if key in imported_days:
+            results.append({"date": checkpoint_date, "status": "skipped", "reason": "already_imported"})
+            continue
+        if checkpoint_date in already_logged:
+            results.append({
+                "date": checkpoint_date,
+                "status": "skipped",
+                "reason": "already_logged_on_storygraph",
+            })
+            continue
+        if percent is None:
+            results.append({"date": checkpoint_date, "status": "skipped", "reason": "no_percent"})
+            continue
+        try:
+            ok = client.add_dated_progress_entry(storygraph_book_id, checkpoint_date, percent)
+        except req.RequestException as exc:
+            logger.warning("[%s] History write failed for %s on %s: %s", label, item_id, checkpoint_date, exc)
+            results.append({"date": checkpoint_date, "status": "failed", "reason": str(exc)})
+            continue
+        if ok:
+            posted.append({"date": checkpoint_date, "percent": percent, "key": key})
+        else:
+            results.append({"date": checkpoint_date, "status": "failed", "reason": "storygraph_rejected"})
+
+    # The form can return HTTP success without saving. Only the journal is
+    # authoritative, so never advance durable state until the entry appears.
+    if posted:
+        try:
+            now_logged = client.get_logged_progress_dates(storygraph_book_id)
+        except req.RequestException:
+            now_logged = set()
+        for entry in posted:
+            if entry["date"] in now_logged:
+                imported_days[entry["key"]] = {
+                    "percent": entry["percent"],
+                    "imported_at": time.time(),
+                }
+                results.append({
+                    "date": entry["date"],
+                    "status": "success",
+                    "progress_percent": entry["percent"],
+                })
+            else:
+                results.append({
+                    "date": entry["date"],
+                    "status": "failed",
+                    "reason": "storygraph_did_not_save",
+                })
+        _import_store.save(user_id)
+
+    results.sort(key=lambda result: result["date"])
+    return results
+
+
+def _daily_history_range(state: dict, local_date: str) -> tuple[date_cls, date_cls]:
+    """Completed local days this run owns: yesterday, plus downtime catch-up."""
+    run_date = date_cls.fromisoformat(local_date)
+    end_date = run_date - timedelta(days=1)
+    try:
+        start_date = date_cls.fromisoformat(state.get("last_daily_run", ""))
+    except (TypeError, ValueError):
+        start_date = end_date
+    return min(start_date, end_date), end_date
+
+
+def _daily_history_sync(
+    user_id: str,
+    books: list[dict],
+    start_date: date_cls,
+    end_date: date_cls,
+    client: StoryGraphClient,
+    label: str,
+) -> bool:
+    """Reconcile completed ABS listening days through History Import's path."""
+    all_ok = True
+    synced = _sync_store.get(user_id)
+    for book in books:
+        item_id = book.get("abs_item_id")
+        if not item_id or book.get("current_minutes", 0) <= 0:
+            continue
+        try:
+            sessions = get_abs_listening_sessions(user_id, item_id)
+            checkpoints = _history_checkpoints(
+                sessions,
+                book.get("duration_minutes", 0),
+                start_date,
+                end_date,
+            )
+            if not checkpoints:
+                continue
+            sync_state = synced.get(_book_state_key(book)) or {}
+            storygraph_book_id = sync_state.get("storygraph_book_id")
+            if not storygraph_book_id:
+                logger.warning("[%s] Daily history has no matched edition for '%s'", label, book["title"])
+                all_ok = False
+                continue
+            results = _reconcile_history_checkpoints(
+                user_id,
+                item_id,
+                storygraph_book_id,
+                checkpoints,
+                set(checkpoints),
+                client,
+                label,
+                ensure_read_status=False,
+            )
+            if any(result["status"] == "failed" for result in results):
+                all_ok = False
+            written = sum(1 for result in results if result["status"] == "success")
+            logger.info(
+                "[%s] Daily history for '%s' (%s to %s): %d/%d days written",
+                label, book["title"], start_date, end_date, written, len(results),
+            )
+        except (req.RequestException, ValueError) as exc:
+            logger.warning("[%s] Daily history failed for '%s': %s", label, book["title"], exc)
+            all_ok = False
+    return all_ok
+
+
 def _mark_handled_lifecycle(state: dict, progress: dict, item_id: str):
     started, finished = _progress_lifecycle(progress)
     item_state = state.setdefault("books", {}).setdefault(item_id, {})
@@ -910,42 +1104,98 @@ def _poll_user(user: dict, now: datetime | None = None):
 
         daily_due, local_date = _daily_schedule(user_id, now)
         scheduled_run = mode == "daily" and daily_due
+        pending_daily = set(scheduler_state.get("pending_daily_items", []))
+        if mode == "daily" and changes:
+            # A finished book can leave the default In Progress scope before
+            # midnight. Retain lifecycle items until their completed listening
+            # days have been reconciled successfully.
+            pending_daily.update(changes)
+            scheduler_state["pending_daily_items"] = sorted(pending_daily)
+
         scoped_books = []
+        unresolved_pending = set()
         if mode == "frequent" or scheduled_run:
             scoped_books = get_abs_books(user_id, scope, progress_by_item=progress_by_item)
+            if scheduled_run:
+                present = {_book_state_key(book) for book in scoped_books}
+                for item_id in sorted(pending_daily - present):
+                    progress = progress_by_item.get(item_id)
+                    if progress is None:
+                        unresolved_pending.add(item_id)
+                        continue
+                    book = get_abs_book(user_id, item_id, progress)
+                    if book:
+                        scoped_books.append(book)
+                    else:
+                        unresolved_pending.add(item_id)
             with _status_cache_lock:
                 _status_cache[user_id] = {"books": scoped_books, "abs_ok": True, "ts": time.time()}
 
-        selected = (
-            _frequent_sync_candidates(user_id, scoped_books)
-            if mode == "frequent"
-            else list(scoped_books)
-        )
+        selected = _frequent_sync_candidates(user_id, scoped_books) if mode == "frequent" else []
         by_item = {_book_state_key(book): book for book in selected}
+        scoped_by_item = {_book_state_key(book): book for book in scoped_books}
         for item_id in changes:
             if item_id not in by_item:
-                book = get_abs_book(user_id, item_id, progress_by_item[item_id])
+                book = scoped_by_item.get(item_id) or get_abs_book(
+                    user_id,
+                    item_id,
+                    progress_by_item[item_id],
+                )
                 if book:
                     by_item[item_id] = book
 
-        to_sync = list(by_item.values())
-        results = []
-        if to_sync:
+        lifecycle_books = list(by_item.values())
+        lifecycle_results = []
+        if lifecycle_books:
             start_before_finish = {
                 item_id
                 for item_id, change in changes.items()
                 if change["start"] and change["finish"]
             }
-            results = do_sync(user_id, to_sync, start_before_finish=start_before_finish)
-            for book, result in zip(to_sync, results):
+            lifecycle_results = do_sync(
+                user_id,
+                lifecycle_books,
+                start_before_finish=start_before_finish,
+            )
+            for book, result in zip(lifecycle_books, lifecycle_results):
                 item_id = book.get("abs_item_id")
                 if item_id and result["status"] in {"success", "unchanged"}:
                     _mark_handled_lifecycle(scheduler_state, progress_by_item.get(item_id, {}), item_id)
-            synced = sum(1 for r in results if r["status"] == "success")
-            logger.info("[%s] Auto-sync: %d/%d synced", label, synced, len(to_sync))
+            synced = sum(1 for result in lifecycle_results if result["status"] == "success")
+            logger.info("[%s] Auto-sync: %d/%d synced", label, synced, len(lifecycle_books))
 
         if scheduled_run:
-            scheduler_state["last_daily_run"] = local_date
+            daily_client = StoryGraphClient(
+                cfg(user_id, "STORYGRAPH_SESSION"),
+                cfg(user_id, "STORYGRAPH_REMEMBER_TOKEN"),
+            )
+            status_results = do_sync(
+                user_id,
+                scoped_books,
+                write_progress=False,
+                client=daily_client,
+            ) if scoped_books else []
+            statuses_ok = not unresolved_pending and all(
+                result["status"] in {"success", "unchanged"}
+                for result in status_results
+            )
+            start_date, end_date = _daily_history_range(scheduler_state, local_date)
+            history_ok = statuses_ok and _daily_history_sync(
+                user_id,
+                scoped_books,
+                start_date,
+                end_date,
+                daily_client,
+                label,
+            )
+            if history_ok:
+                scheduler_state["last_daily_run"] = local_date
+                scheduler_state["pending_daily_items"] = []
+            else:
+                logger.warning(
+                    "[%s] Daily history incomplete; it will retry without duplicating verified days",
+                    label,
+                )
         if changes or scheduled_run:
             _scheduler_store.save(user_id)
     except Exception as e:
@@ -1387,78 +1637,27 @@ def api_history_import(item_id):
     except req.RequestException as exc:
         logger.warning("History import could not re-read ABS for %s: %s", item_id, exc)
         return jsonify({"error": "Could not load listening history from Audiobookshelf"}), 502
-    checkpoints = {
-        day_key(day["date"], day["end_position_minutes"]): day
-        for day in build_history_preview(sessions, book["duration_minutes"])["days"]
-    }
-
-    imported_days = _import_store.get(user_id)[item_id].setdefault("imported_days", {})
+    checkpoints = _history_checkpoints(sessions, book["duration_minutes"])
 
     label = (get_user(user_id) or {}).get("username") or user_id
     try:
         client = StoryGraphClient(cfg(user_id, "STORYGRAPH_SESSION"), cfg(user_id, "STORYGRAPH_REMEMBER_TOKEN"))
         if not client.check_auth():
             return jsonify({"error": "StoryGraph session invalid — update it in Settings"}), 401
-        # A dated progress entry needs an existing read status to attach to —
-        # a book that's never been touched on StoryGraph (still "to read") has
-        # no such record. ensure_status() is a no-op if one already exists.
-        status_ok, _, _ = client.ensure_status(storygraph_book_id, "currently-reading")
-        if not status_ok:
-            return jsonify({"error": "Could not set this book to 'currently reading' on StoryGraph, which a dated entry needs to attach to"}), 502
-        already_logged = client.get_logged_progress_dates(storygraph_book_id)
+        results = _reconcile_history_checkpoints(
+            user_id,
+            item_id,
+            storygraph_book_id,
+            checkpoints,
+            requested,
+            client,
+            label,
+        )
+    except HistoryReconcileError as exc:
+        return jsonify({"error": str(exc)}), 502
     except req.RequestException as exc:
         logger.warning("History import failed to reach StoryGraph for %s: %s", item_id, exc)
         return jsonify({"error": "Could not reach StoryGraph"}), 502
-
-    results = []
-    posted = []  # entries StoryGraph gave an HTTP-success response for, pending verification
-    for key in sorted(requested):
-        day = checkpoints.get(key)
-        if day is None:
-            # Either the browser sent a key from a preview ABS has since moved
-            # past, or it made one up. Same answer either way.
-            results.append({"date": key.split("@", 1)[0], "status": "skipped", "reason": "stale_preview"})
-            continue
-        date, percent = day["date"], day["progress_percent"]
-        if key in imported_days:
-            results.append({"date": date, "status": "skipped", "reason": "already_imported"})
-            continue
-        if date in already_logged:
-            results.append({"date": date, "status": "skipped", "reason": "already_logged_on_storygraph"})
-            continue
-        if percent is None:
-            results.append({"date": date, "status": "skipped", "reason": "no_percent"})
-            continue
-        try:
-            ok = client.add_dated_progress_entry(storygraph_book_id, date, percent)
-        except req.RequestException as exc:
-            logger.warning("[%s] Import write failed for %s on %s: %s", label, item_id, date, exc)
-            results.append({"date": date, "status": "failed", "reason": str(exc)})
-            continue
-        if ok:
-            posted.append({"date": date, "percent": percent, "key": key})
-        else:
-            results.append({"date": date, "status": "failed", "reason": "storygraph_rejected"})
-
-    # /update-progress-with-note is a full-page form, not the small AJAX widgets
-    # ensure_status()/update_progress() use — a 200/302 there doesn't reliably
-    # mean StoryGraph actually saved anything (e.g. a rejected CSRF token or
-    # format mismatch can still redirect). Confirm against the real journal
-    # before ever treating a day as imported or recording it as done.
-    if posted:
-        try:
-            now_logged = client.get_logged_progress_dates(storygraph_book_id)
-        except req.RequestException:
-            now_logged = set()
-        for p in posted:
-            if p["date"] in now_logged:
-                imported_days[p["key"]] = {"percent": p["percent"], "imported_at": time.time()}
-                results.append({"date": p["date"], "status": "success", "progress_percent": p["percent"]})
-            else:
-                results.append({"date": p["date"], "status": "failed", "reason": "storygraph_did_not_save"})
-        _import_store.save(user_id)
-
-    results.sort(key=lambda r: r["date"])
     imported = sum(1 for r in results if r["status"] == "success")
     logger.info("[%s] History import for %s: %d/%d days written", label, item_id, imported, len(results))
     return jsonify({"imported": imported, "total": len(results), "results": results})

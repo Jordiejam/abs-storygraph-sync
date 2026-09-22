@@ -3,7 +3,7 @@
 import shutil
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import app as A
 
@@ -40,6 +40,7 @@ class SchedulerTests(unittest.TestCase):
         self.data_dir = tempfile.mkdtemp(prefix="abs-sg-scheduler-")
         A._config_store = A._UserJsonStore(f"{self.data_dir}/config")
         A._sync_store = A._UserJsonStore(f"{self.data_dir}/sync")
+        A._import_store = A._UserJsonStore(f"{self.data_dir}/import")
         A._scheduler_store = A._UserJsonStore(f"{self.data_dir}/scheduler")
         A._status_cache.clear()
         A.set_cfg(self.USER_ID, {
@@ -56,12 +57,15 @@ class SchedulerTests(unittest.TestCase):
         self.real_books = A.get_abs_books
         self.real_book = A.get_abs_book
         self.real_sync = A.do_sync
+        self.real_daily_history = A._daily_history_sync
+        A._daily_history_sync = lambda *args, **kwargs: True
 
     def tearDown(self):
         A.get_abs_progress = self.real_progress
         A.get_abs_books = self.real_books
         A.get_abs_book = self.real_book
         A.do_sync = self.real_sync
+        A._daily_history_sync = self.real_daily_history
         shutil.rmtree(self.data_dir, ignore_errors=True)
 
     def initialized_state(self, **updates):
@@ -110,7 +114,7 @@ class SchedulerTests(unittest.TestCase):
         A.get_abs_book = lambda user_id, item_id, item_progress: book()
         calls = []
 
-        def fake_sync(user_id, books, start_before_finish=None):
+        def fake_sync(user_id, books, start_before_finish=None, **kwargs):
             calls.append((books, start_before_finish))
             return [{"status": "success", "title": books[0]["title"]}]
 
@@ -127,7 +131,7 @@ class SchedulerTests(unittest.TestCase):
         A.get_abs_book = lambda user_id, item_id, item_progress: book(finished=True)
         starts = []
 
-        def fake_sync(user_id, books, start_before_finish=None):
+        def fake_sync(user_id, books, start_before_finish=None, **kwargs):
             starts.append(start_before_finish)
             return [{"status": "success", "title": books[0]["title"]}]
 
@@ -143,7 +147,7 @@ class SchedulerTests(unittest.TestCase):
         A.get_abs_book = lambda user_id, item_id, item_progress: book()
         calls = []
 
-        def fake_sync(user_id, books, start_before_finish=None):
+        def fake_sync(user_id, books, start_before_finish=None, **kwargs):
             calls.append(books)
             return [{"status": "failed", "title": books[0]["title"]}]
 
@@ -154,14 +158,16 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(2, len(calls))
 
     def test_scheduled_run_is_recorded_and_not_repeated(self):
-        self.initialized_state()
+        self.initialized_state(
+            books={"item-1": {"handled_started_at": 100, "handled_finished_at": None}},
+        )
         snapshot = {"item-1": progress()}
         A.get_abs_progress = lambda user_id: snapshot
         A.get_abs_books = lambda *args, **kwargs: [book()]
         calls = []
 
-        def fake_sync(user_id, books, start_before_finish=None):
-            calls.append(books)
+        def fake_sync(user_id, books, start_before_finish=None, **kwargs):
+            calls.append((books, kwargs))
             return [{"status": "success", "title": books[0]["title"]}]
 
         A.do_sync = fake_sync
@@ -169,7 +175,68 @@ class SchedulerTests(unittest.TestCase):
         A._poll_user(self.user, now)
         A._poll_user(self.user, now)
         self.assertEqual(1, len(calls))
+        self.assertFalse(calls[0][1]["write_progress"])
         self.assertEqual("2026-09-21", A._scheduler_store.get(self.USER_ID)["last_daily_run"])
+
+    def test_first_daily_history_range_is_yesterday_only(self):
+        self.assertEqual(
+            (date(2026, 9, 20), date(2026, 9, 20)),
+            A._daily_history_range({}, "2026-09-21"),
+        )
+
+    def test_daily_history_range_catches_up_after_downtime(self):
+        self.assertEqual(
+            (date(2026, 9, 18), date(2026, 9, 20)),
+            A._daily_history_range({"last_daily_run": "2026-09-18"}, "2026-09-21"),
+        )
+
+    def test_finished_book_stays_pending_until_daily_history_succeeds(self):
+        self.initialized_state(
+            books={"item-1": {"handled_started_at": 100, "handled_finished_at": None}},
+        )
+        snapshot = {"item-1": progress(finished=True, finished_at=200)}
+        A.get_abs_progress = lambda user_id: snapshot
+        A.get_abs_books = lambda *args, **kwargs: []
+        A.get_abs_book = lambda user_id, item_id, item_progress: book(finished=True)
+        seen = []
+
+        def fake_sync(user_id, books, start_before_finish=None, **kwargs):
+            return [{"status": "success", "title": candidate["title"]} for candidate in books]
+
+        def fake_history(user_id, books, *args, **kwargs):
+            seen.extend(candidate["abs_item_id"] for candidate in books)
+            return True
+
+        A.do_sync = fake_sync
+        A._daily_history_sync = fake_history
+        A._poll_user(self.user, datetime(2026, 9, 21, 12, tzinfo=timezone.utc))
+
+        state = A._scheduler_store.get(self.USER_ID)
+        self.assertEqual(["item-1"], seen)
+        self.assertEqual([], state["pending_daily_items"])
+        self.assertEqual("2026-09-21", state["last_daily_run"])
+
+    def test_failed_daily_history_is_retried_without_advancing_the_day(self):
+        self.initialized_state(pending_daily_items=["item-1"])
+        snapshot = {"item-1": progress()}
+        A.get_abs_progress = lambda user_id: snapshot
+        A.get_abs_books = lambda *args, **kwargs: [book()]
+        A.get_abs_book = lambda user_id, item_id, item_progress: book()
+        calls = []
+
+        def fake_sync(user_id, books, start_before_finish=None, **kwargs):
+            return [{"status": "success", "title": candidate["title"]} for candidate in books]
+
+        A.do_sync = fake_sync
+        A._daily_history_sync = lambda *args, **kwargs: calls.append(args) or False
+        now = datetime(2026, 9, 21, 12, tzinfo=timezone.utc)
+        A._poll_user(self.user, now)
+        A._poll_user(self.user, now)
+
+        state = A._scheduler_store.get(self.USER_ID)
+        self.assertEqual(2, len(calls))
+        self.assertNotIn("last_daily_run", state)
+        self.assertEqual(["item-1"], state["pending_daily_items"])
 
     def test_frequent_threshold_uses_durable_sync_position(self):
         A._sync_store.get(self.USER_ID)["item-1"] = {
