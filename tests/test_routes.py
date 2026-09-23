@@ -247,6 +247,20 @@ class ImportWriteTests(_ImportRouteCase):
         self.assertEqual("already_imported", self.reasons(body)["2026-01-06"])
         self.assertEqual(2, body["imported"])
 
+    def test_daily_retry_skips_the_journal_once_every_day_is_imported(self):
+        user_id = self.user["id"]
+        A._sync_store.get(user_id)[self.ITEM] = {
+            "pct": 30.0,
+            "status": "currently-reading",
+            "storygraph_book_id": AUDIO.book_id,
+        }
+        day = A.date_cls.fromisoformat("2026-01-06")
+        A._daily_history_sync(user_id, [dict(self.book)], day, day, FakeStoryGraph(), "jordan")
+
+        retry = FakeStoryGraph()
+        self.assertTrue(A._daily_history_sync(user_id, [dict(self.book)], day, day, retry, "jordan"))
+        self.assertEqual([], retry.calls)
+
     def test_imports_every_confirmed_day_including_the_ensure_status_day(self):
         keys = self.all_keys()
         body = self.do_import(keys).get_json()

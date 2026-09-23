@@ -930,9 +930,12 @@ def _reconcile_history_checkpoints(
                 "which a dated entry needs to attach to"
             )
 
-    already_logged = client.get_logged_progress_dates(storygraph_book_id)
     item_state = _import_store.get(user_id).setdefault(item_id, {})
     imported_days = item_state.setdefault("imported_days", {})
+    # Daily sync retries every poll until it succeeds, so a book whose days are
+    # all already imported must not cost a StoryGraph journal fetch each time.
+    needs_journal = any(key in checkpoints and key not in imported_days for key in requested)
+    already_logged = client.get_logged_progress_dates(storygraph_book_id) if needs_journal else set()
     results = []
     posted = []
 
@@ -1036,11 +1039,13 @@ def _daily_history_sync(
             )
             if not checkpoints:
                 continue
-            sync_state = synced.get(_book_state_key(book)) or {}
+            # Same lookup as do_sync, including its legacy title-keyed state.
+            sync_state = synced.get(_book_state_key(book)) or synced.get(book["title"]) or {}
             storygraph_book_id = sync_state.get("storygraph_book_id")
             if not storygraph_book_id:
-                logger.warning("[%s] Daily history has no matched edition for '%s'", label, book["title"])
-                all_ok = False
+                # Retrying can't conjure an edition, so this must not hold the
+                # whole daily run back for every other book.
+                logger.warning("[%s] Daily history has no matched edition for '%s'; skipping it", label, book["title"])
                 continue
             results = _reconcile_history_checkpoints(
                 user_id,
@@ -1113,21 +1118,19 @@ def _poll_user(user: dict, now: datetime | None = None):
             scheduler_state["pending_daily_items"] = sorted(pending_daily)
 
         scoped_books = []
-        unresolved_pending = set()
         if mode == "frequent" or scheduled_run:
             scoped_books = get_abs_books(user_id, scope, progress_by_item=progress_by_item)
             if scheduled_run:
                 present = {_book_state_key(book) for book in scoped_books}
                 for item_id in sorted(pending_daily - present):
                     progress = progress_by_item.get(item_id)
-                    if progress is None:
-                        unresolved_pending.add(item_id)
-                        continue
-                    book = get_abs_book(user_id, item_id, progress)
+                    book = get_abs_book(user_id, item_id, progress) if progress is not None else None
                     if book:
                         scoped_books.append(book)
                     else:
-                        unresolved_pending.add(item_id)
+                        # Removed from ABS since it finished. Waiting for it
+                        # would block every other book's daily run forever.
+                        logger.warning("[%s] Daily sync: ABS item %s is gone; dropping it", label, item_id)
             with _status_cache_lock:
                 _status_cache[user_id] = {"books": scoped_books, "abs_ok": True, "ts": time.time()}
 
@@ -1175,20 +1178,33 @@ def _poll_user(user: dict, now: datetime | None = None):
                 write_progress=False,
                 client=daily_client,
             ) if scoped_books else []
-            statuses_ok = not unresolved_pending and all(
-                result["status"] in {"success", "unchanged"}
-                for result in status_results
-            )
+            # Judge each book on its own. A book StoryGraph has no audio
+            # edition for will never match on a retry, so it is skipped rather
+            # than holding back every other book's history and the day itself.
+            # Anything else (auth, network, a rejected write) may clear up, so
+            # it keeps the day open for the next poll.
+            history_books = []
+            retry = False
+            for book, result in zip(scoped_books, status_results):
+                if result["status"] in {"success", "unchanged"}:
+                    history_books.append(book)
+                elif result["status"] == "not_found":
+                    logger.warning(
+                        "[%s] Daily sync: no StoryGraph match for '%s'; skipping it",
+                        label, book["title"],
+                    )
+                else:
+                    retry = True
             start_date, end_date = _daily_history_range(scheduler_state, local_date)
-            history_ok = statuses_ok and _daily_history_sync(
+            history_ok = _daily_history_sync(
                 user_id,
-                scoped_books,
+                history_books,
                 start_date,
                 end_date,
                 daily_client,
                 label,
             )
-            if history_ok:
+            if history_ok and not retry:
                 scheduler_state["last_daily_run"] = local_date
                 scheduler_state["pending_daily_items"] = []
             else:
