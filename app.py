@@ -5,7 +5,14 @@ ABS to StoryGraph Sync Service
 from flask import Flask, jsonify, request, render_template, session, redirect, url_for, g
 from urllib.parse import urlparse
 from functools import wraps
-import os, re, json, logging, threading, time, uuid
+import json
+import logging
+import os
+import re
+import tempfile
+import threading
+import time
+import uuid
 from collections import deque
 from datetime import date as date_cls, datetime, timezone, time as datetime_time, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -45,8 +52,25 @@ PUBLIC_URL = (os.environ.get("PUBLIC_URL") or "").rstrip("/")
 
 SYNC_SCOPES = ("in_progress", "in_progress_finished", "library")
 SYNC_MODES = ("frequent", "daily")
+DEFAULT_SYNC_SCOPE = "in_progress"
+DEFAULT_SYNC_MODE = "frequent"
 DEFAULT_DAILY_SYNC_TIME = "00:00"
 DEFAULT_TIMEZONE = "UTC"
+
+
+def _write_json_atomic(path: str, data):
+    """Write to a temp file and swap it in, so a crash mid-write can't leave a
+    truncated file that the loaders would silently read as empty."""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=directory, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, path)
+    except BaseException:
+        os.unlink(tmp_path)
+        raise
 
 
 def _get_secret_key() -> bytes:
@@ -105,9 +129,7 @@ def _load_users() -> list[dict]:
 
 
 def _save_users(users: list[dict]):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(USERS_FILE, "w") as f:
-        json.dump(users, f, indent=2)
+    _write_json_atomic(USERS_FILE, users)
 
 
 def any_users_exist() -> bool:
@@ -167,6 +189,10 @@ def delete_user(user_id: str):
         users = [u for u in _load_users() if u["id"] != user_id]
         _save_users(users)
 
+
+def _user_label(user: dict) -> str:
+    return user.get("username") or user.get("display_name") or user["id"]
+
 # ── Per-user JSON stores ─────────────────────────────────────────────────────
 # Config, sync state and History Import state all want the same thing: one
 # {user_id}.json under a directory, read once and cached in memory, rewritten
@@ -195,10 +221,7 @@ class _UserJsonStore:
 
     def save(self, user_id: str):
         with self._lock:
-            data = self._cache.get(user_id, {})
-            os.makedirs(self._dir, exist_ok=True)
-            with open(self._path(user_id), "w") as f:
-                json.dump(data, f, indent=2)
+            _write_json_atomic(self._path(user_id), self._cache.get(user_id, {}))
 
 
 _config_store = _UserJsonStore(CONFIG_DIR)
@@ -218,9 +241,28 @@ _import_store = _UserJsonStore(IMPORT_STATE_DIR)
 # that successfully reached StoryGraph.
 _scheduler_store = _UserJsonStore(SCHEDULER_STATE_DIR)
 
+_user_locks: dict[str, threading.RLock] = {}
+_user_locks_guard = threading.Lock()
+
+
+def _user_lock(user_id: str) -> threading.RLock:
+    """The stores hand out live dicts, so the poller and a request thread must
+    not edit (or save) the same user's state at once. Held around anything
+    that mutates it."""
+    with _user_locks_guard:
+        return _user_locks.setdefault(user_id, threading.RLock())
+
 
 def cfg(user_id: str, key: str, default: str = "") -> str:
     return _config_store.get(user_id).get(key) or default
+
+
+ABS_KEYS = ("ABS_URL", "ABS_TOKEN")
+SYNC_KEYS = (*ABS_KEYS, "STORYGRAPH_SESSION")
+
+
+def _missing_cfg(user_id: str, keys) -> list[str]:
+    return [k for k in keys if not cfg(user_id, k)]
 
 
 def set_cfg(user_id: str, updates: dict):
@@ -235,12 +277,17 @@ def _saved_edition(user_id: str, item_id: str) -> dict | None:
 
 # ── ABS ───────────────────────────────────────────────────────────────────────
 
-def _abs_headers(user_id: str) -> dict:
-    return {"Authorization": f"Bearer {cfg(user_id, 'ABS_TOKEN')}"}
-
-
-def _abs_get(user_id: str, path: str, params: dict | None = None):
-    resp = req.get(f"{cfg(user_id, 'ABS_URL')}{path}", headers=_abs_headers(user_id), params=params, timeout=10)
+def _abs_get(user_id: str, path: str, params: dict | None = None, *, required: bool = True):
+    """GET from this user's ABS. `required=False` returns None on a non-200
+    instead of raising, for lookups where a missing record is normal."""
+    resp = req.get(
+        f"{cfg(user_id, 'ABS_URL')}{path}",
+        headers={"Authorization": f"Bearer {cfg(user_id, 'ABS_TOKEN')}"},
+        params=params,
+        timeout=10,
+    )
+    if not required and resp.status_code != 200:
+        return None
     resp.raise_for_status()
     return resp
 
@@ -281,14 +328,8 @@ def get_abs_progress(user_id: str) -> dict[str, dict]:
 
 
 def get_abs_book(user_id: str, item_id: str, progress: dict) -> dict | None:
-    item_resp = req.get(
-        f"{cfg(user_id, 'ABS_URL')}/api/items/{item_id}",
-        headers=_abs_headers(user_id),
-        timeout=10,
-    )
-    if item_resp.status_code != 200:
-        return None
-    return _item_to_book(item_resp.json(), progress)
+    resp = _abs_get(user_id, f"/api/items/{item_id}", required=False)
+    return _item_to_book(resp.json(), progress) if resp is not None else None
 
 
 def get_abs_books(
@@ -296,26 +337,13 @@ def get_abs_books(
     scope: str,
     progress_by_item: dict[str, dict] | None = None,
 ) -> list[dict]:
-    if scope == "in_progress":
-        resp = _abs_get(user_id, "/api/me/items-in-progress")
-        books = []
-        for item in resp.json().get("libraryItems", []):
-            item_id = item.get("id", "")
-            if progress_by_item is not None:
-                progress = progress_by_item.get(item_id, {})
-            elif item_id:
-                pr = req.get(f"{cfg(user_id, 'ABS_URL')}/api/me/progress/{item_id}", headers=_abs_headers(user_id), timeout=10)
-                progress = pr.json() if pr.status_code == 200 else {}
-            else:
-                progress = {}
-            book = _item_to_book(item, progress)
-            if book:
-                books.append(book)
-        return books
-
-    # in_progress_finished / library both need every progress entry the user has
     if progress_by_item is None:
         progress_by_item = get_abs_progress(user_id)
+
+    if scope == "in_progress":
+        items = _abs_get(user_id, "/api/me/items-in-progress").json().get("libraryItems", [])
+        books = [_item_to_book(item, progress_by_item.get(item.get("id"), {})) for item in items]
+        return [book for book in books if book]
 
     if scope == "in_progress_finished":
         books = []
@@ -443,10 +471,7 @@ class StoryGraphClient:
 
     def load_editions(self, title, author) -> list:
         """Every edition StoryGraph lists for the closest search result to
-        (title, author) — one browse plus one editions fetch. Callers that need
-        both a confident match and the full candidate list (to offer a manual
-        pick when the match fails) load once and pass the result to
-        match_audio_edition(), rather than paying for the round trips twice."""
+        (title, author). Pass the result to match_audio_edition()."""
         initial_id = self._find_initial_book_id(title, author)
         if not initial_id:
             logger.warning("No StoryGraph result for '%s'", title)
@@ -484,14 +509,9 @@ class StoryGraphClient:
             )
         return matched
 
-    def find_audio_edition(self, title, author, duration_minutes=0, identifiers=None):
-        """load_editions() + match_audio_edition(), for callers that don't also
-        need the unfiltered candidate list."""
-        return self.match_audio_edition(
-            self.load_editions(title, author), title, duration_minutes, identifiers
-        )
-
     def search_book(self, title, author, duration_minutes=0, identifiers=None) -> str | None:
+        # With nothing to match an edition on (e.g. an ebook in the library
+        # scope), fall back to the top search result.
         if not duration_minutes and not identifiers:
             initial_id = self._find_initial_book_id(title, author)
             if initial_id:
@@ -499,17 +519,16 @@ class StoryGraphClient:
             else:
                 logger.warning("No StoryGraph result for '%s'", title)
             return initial_id
-        matched = self.find_audio_edition(title, author, duration_minutes, identifiers)
+        editions = self.load_editions(title, author)
+        matched = self.match_audio_edition(editions, title, duration_minutes, identifiers)
         return matched.book_id if matched else None
 
     def get_book_page(self, book_id) -> str:
         return self._get(f"/books/{book_id}").text
 
-    def _parse_current_progress(self, html) -> float | None:
-        """Best-effort read of the percentage StoryGraph currently has on file for
-        this book, from the same hidden field update_progress() fills in. Returns
-        None if it can't be found — callers should treat that as 'unknown' and not
-        skip a write on its account."""
+    def parse_current_progress(self, html) -> float | None:
+        """The percentage StoryGraph has on file for this book, or None if it
+        can't be read — treat that as unknown, never as a reason to skip a write."""
         m = re.search(
             r'(?:name="read_status\[progress_number\]"|class="read-status-progress-number")[^>]*value="([^"]*)"',
             html,
@@ -559,18 +578,11 @@ class StoryGraphClient:
         return ok
 
     def get_logged_progress_dates(self, book_id) -> set[str]:
-        """The dates StoryGraph already has a *progress* entry on for this book —
-        the read side of duplicate-avoidance for History Import, entirely
-        GET-based. Status-only entries are excluded (see journal.progress_dates):
-        counting them would let this route's own ensure_status() write block the
-        import of today's listening.
+        """The dates StoryGraph already has a *progress* entry on for this book
+        (status-only entries excluded, see journal.progress_dates).
 
-        Paginated (confirmed live): the journal page only renders ~20 entries
-        before needing page=2, 3, ... — a book with more than that silently
-        hid the rest, which under-reported real successes as failures the
-        first time this was tested against a live account. Stops once a page
-        adds no entries we haven't already seen, with a sane upper bound
-        since StoryGraph documents no page cap."""
+        The journal renders ~20 entries per page, so this pages until one adds
+        nothing new, capped since StoryGraph documents no limit."""
         seen_ids: set[str] = set()
         dates: set[str] = set()
         page = 1
@@ -587,20 +599,13 @@ class StoryGraphClient:
         return dates
 
     def add_dated_progress_entry(self, book_id, date: str, percent: float) -> bool:
-        """Writes one backdated journal entry via the same 'Add note/Edit date'
-        progress form a person would use by hand.
+        """Writes one backdated journal entry via StoryGraph's 'Add note/Edit
+        date' progress form.
 
-        Always posts a percentage: StoryGraph computes the actual position from
-        its own known edition length, so it's immune to any runtime mismatch
-        between our matched/selected edition and the source ABS audiobook (a
-        manually-picked or close-tolerance match can differ by many minutes).
-        Confirmed against the real form (read-only GET): for an audiobook
-        edition "percentage" is a real, submittable progress_type, not just UI
-        toggle state.
-
-        Re-fetches the progress-update page immediately before posting so the
-        CSRF token and any baseline context fields StoryGraph expects reflect
-        whatever it actually has on file at that moment."""
+        Posts a percentage so StoryGraph derives the position from its own
+        edition length, which tolerates a runtime mismatch with the ABS
+        audiobook. The form page is re-fetched first for a fresh CSRF token and
+        the baseline fields it expects."""
         page_html = self._get(f"/progress-update?book_id={book_id}").text
 
         def _hidden(name: str) -> str:
@@ -630,6 +635,10 @@ class StoryGraphClient:
         )
         return ok
 
+
+def _storygraph_client(user_id: str) -> StoryGraphClient:
+    return StoryGraphClient(cfg(user_id, "STORYGRAPH_SESSION"), cfg(user_id, "STORYGRAPH_REMEMBER_TOKEN"))
+
 # ── Sync logic ────────────────────────────────────────────────────────────────
 
 _status_cache: dict[str, dict] = {}
@@ -637,18 +646,32 @@ _status_cache_lock = threading.Lock()
 STATUS_CACHE_TTL = 60  # seconds
 
 
-def get_cached_books(user_id: str, scope: str) -> tuple[list[dict], bool]:
+def _cache_books(user_id: str, scope: str, books: list[dict]):
     with _status_cache_lock:
-        cache = _status_cache.get(user_id, {"books": [], "abs_ok": False, "ts": 0.0})
-        if time.time() - cache["ts"] < STATUS_CACHE_TTL:
-            return cache["books"], cache["abs_ok"]
+        _status_cache[user_id] = {"scope": scope, "books": books, "ts": time.time()}
+
+
+def _fresh_cached_books(user_id: str, scope: str) -> list[dict] | None:
+    """The cached book list, or None if it's stale or for another scope."""
+    with _status_cache_lock:
+        cache = _status_cache.get(user_id)
+    if cache and cache["scope"] == scope and time.time() - cache["ts"] < STATUS_CACHE_TTL:
+        return cache["books"]
+    return None
+
+
+def get_cached_books(user_id: str, scope: str) -> tuple[list[dict], bool]:
+    books = _fresh_cached_books(user_id, scope)
+    if books is not None:
+        return books, True
     try:
         books = get_abs_books(user_id, scope)
-        with _status_cache_lock:
-            _status_cache[user_id] = {"books": books, "abs_ok": True, "ts": time.time()}
-        return books, True
     except Exception:
-        return cache["books"], False
+        with _status_cache_lock:
+            cache = _status_cache.get(user_id) or {}
+        return (cache["books"] if cache.get("scope") == scope else []), False
+    _cache_books(user_id, scope, books)
+    return books, True
 
 
 def _target_status(book: dict) -> str:
@@ -663,9 +686,14 @@ def _book_state_key(book: dict) -> str:
     return book.get("abs_item_id") or f"{book['title']}|{book.get('author', '')}"
 
 
+def _previous_sync(synced: dict, book: dict) -> dict | None:
+    """This book's last successful sync, including legacy title-keyed state."""
+    return synced.get(_book_state_key(book)) or synced.get(book["title"])
+
+
 def _last_synced_minutes(user_id: str, book: dict) -> float | None:
     """Durable last position, with a migration fallback for older state files."""
-    previous = _sync_store.get(user_id).get(_book_state_key(book))
+    previous = _previous_sync(_sync_store.get(user_id), book)
     if not previous:
         return None
     if previous.get("current_minutes") is not None:
@@ -675,19 +703,25 @@ def _last_synced_minutes(user_id: str, book: dict) -> float | None:
     return None
 
 
+def _sync_result(book: dict, status: str) -> dict:
+    return {
+        "title": book["title"],
+        "status": status,
+        "progress_percent": book["progress_percent"],
+        "current_minutes": book["current_minutes"],
+    }
+
+
 def do_sync(
     user_id: str,
     books: list[dict],
     start_before_finish: set[str] | None = None,
     write_progress: bool = True,
     client: StoryGraphClient | None = None,
+    label: str | None = None,
 ) -> list[dict]:
-    user = get_user(user_id)
-    label = (user or {}).get("username") or (user or {}).get("display_name") or user_id
-    client = client or StoryGraphClient(
-        cfg(user_id, "STORYGRAPH_SESSION"),
-        cfg(user_id, "STORYGRAPH_REMEMBER_TOKEN"),
-    )
+    label = label or _user_label(get_user(user_id) or {"id": user_id})
+    client = client or _storygraph_client(user_id)
     if not client.check_auth():
         logger.error("[%s] StoryGraph session invalid — update STORYGRAPH_SESSION", label)
         return [{"title": b["title"], "status": "auth_error"} for b in books]
@@ -699,14 +733,11 @@ def do_sync(
             pct = book["progress_percent"]
             status = _target_status(book)
             state_key = _book_state_key(book)
-            prev = synced.get(state_key) or synced.get(book["title"])
+            prev = _previous_sync(synced, book)
 
-            # A manual pin is a correction, so it has to outrank the edition an
-            # earlier sync settled on — otherwise "pins this book for both Sync
-            # and Import" would only ever hold for books that hadn't synced yet,
-            # and a bad match could never be fixed. Dropping prev also defeats
-            # the unchanged check below, which is exactly right: the newly
-            # pinned edition has none of the old one's progress on it.
+            # A manual pin is a correction, so it outranks the edition an
+            # earlier sync settled on. Dropping prev also defeats the unchanged
+            # check below: the pinned edition has none of the old one's progress.
             pinned = _pinned_edition_id(user_id, book.get("abs_item_id"))
             if pinned and prev and prev.get("storygraph_book_id") != pinned:
                 logger.info(
@@ -722,15 +753,12 @@ def do_sync(
                 and abs(pct - prev.get("pct", -1)) < 0.5
             ):
                 logger.info("[%s] '%s' unchanged (%s, %.1f%%) — skipping", label, book["title"], status, pct)
-                results.append({"title": book["title"], "status": "unchanged", "progress_percent": pct})
+                results.append(_sync_result(book, "unchanged"))
                 continue
 
             book_id = (prev.get("storygraph_book_id") if prev else None) or pinned
             if not book_id and book.get("abs_item_id"):
-                # Fall back to an edition History Import auto-matched, before
-                # doing a fresh search — otherwise a match made there would only
-                # ever help Import and regular sync would keep failing the same
-                # way forever.
+                # Reuse an edition History Import already matched before searching.
                 edition = _saved_edition(user_id, book["abs_item_id"])
                 if edition:
                     book_id = edition.get("storygraph_book_id")
@@ -751,38 +779,20 @@ def do_sync(
             if status == "read" and state_key in start_before_finish:
                 started_ok, _, _ = client.ensure_status(book_id, "currently-reading")
                 if not started_ok:
-                    results.append({
-                        "title": book["title"],
-                        "status": "failed",
-                        "progress_percent": pct,
-                        "current_minutes": book["current_minutes"],
-                    })
+                    results.append(_sync_result(book, "failed"))
                     continue
 
             ok, already_matched, status_html = client.ensure_status(book_id, status)
             if not ok:
-                results.append({
-                    "title": book["title"],
-                    "status": "failed",
-                    "progress_percent": pct,
-                    "current_minutes": book["current_minutes"],
-                })
+                results.append(_sync_result(book, "failed"))
                 continue
             target_pct = 100 if status == "read" else pct
-            # Skip the progress POST when StoryGraph already agrees with us. "read" is
-            # always 100% by definition, so an already-matched read status is always
-            # safe to skip (this was the original fix for finished-book duplicates).
-            # For "currently reading" we can't assume that — the status label matching
-            # doesn't tell us the percentage matches too — so we additionally parse the
-            # progress StoryGraph has on file and only skip if it's already within
-            # rounding distance of what we'd post. Without this, a book that already
-            # matched (e.g. every "currently reading" book on a fresh install, before
-            # this tool has any local sync-state for it) still got a progress POST on
-            # every single poll, creating a spurious "started" entry and a duplicate
-            # progress update in the StoryGraph journal even though nothing about the
-            # book had actually changed. If we can't parse the current percentage at
-            # all, we conservatively still post — no worse than the old behavior.
-            current_pct = client._parse_current_progress(status_html or "") if already_matched else None
+            # Skip the progress POST when StoryGraph already agrees, since every
+            # POST adds a journal entry. A matched "read" status is 100% by
+            # definition; a matched "currently reading" label says nothing about
+            # the percentage, so compare against what StoryGraph has on file and
+            # still post if that can't be read.
+            current_pct = client.parse_current_progress(status_html or "") if already_matched else None
             skip_progress = status == "to-read" or (
                 already_matched
                 and (status == "read" or (current_pct is not None and abs(current_pct - target_pct) < 0.5))
@@ -799,12 +809,7 @@ def do_sync(
                 if state_key != book["title"]:
                     synced.pop(book["title"], None)
                 _sync_store.save(user_id)
-            results.append({
-                "title": book["title"],
-                "status": "success" if ok else "failed",
-                "progress_percent": pct,
-                "current_minutes": book["current_minutes"],
-            })
+            results.append(_sync_result(book, "success" if ok else "failed"))
         except Exception as e:
             logger.error("[%s] Error syncing '%s': %s", label, book["title"], e)
             results.append({"title": book["title"], "status": "error", "error": str(e)})
@@ -875,7 +880,7 @@ def _frequent_sync_candidates(user_id: str, books: list[dict]) -> list[dict]:
     candidates = []
     synced = _sync_store.get(user_id)
     for book in books:
-        previous_state = synced.get(_book_state_key(book)) or {}
+        previous_state = _previous_sync(synced, book) or {}
         previous = _last_synced_minutes(user_id, book) or 0.0
         newly_finished = book["is_finished"] and previous_state.get("status") != "read"
         progressed = not book["is_finished"] and book["current_minutes"] - previous >= SYNC_THRESHOLD
@@ -1039,8 +1044,7 @@ def _daily_history_sync(
             )
             if not checkpoints:
                 continue
-            # Same lookup as do_sync, including its legacy title-keyed state.
-            sync_state = synced.get(_book_state_key(book)) or synced.get(book["title"]) or {}
+            sync_state = _previous_sync(synced, book) or {}
             storygraph_book_id = sync_state.get("storygraph_book_id")
             if not storygraph_book_id:
                 # Retrying can't conjure an edition, so this must not hold the
@@ -1083,11 +1087,11 @@ def _mark_handled_lifecycle(state: dict, progress: dict, item_id: str):
 
 def _poll_user(user: dict, now: datetime | None = None):
     user_id = user["id"]
-    if not all([cfg(user_id, "ABS_URL"), cfg(user_id, "ABS_TOKEN"), cfg(user_id, "STORYGRAPH_SESSION")]):
+    if _missing_cfg(user_id, SYNC_KEYS):
         return
-    scope = cfg(user_id, "SYNC_SCOPE", "in_progress")
-    mode = cfg(user_id, "SYNC_MODE", "frequent")
-    label = user.get("username") or user.get("display_name") or user_id
+    scope = cfg(user_id, "SYNC_SCOPE", DEFAULT_SYNC_SCOPE)
+    mode = cfg(user_id, "SYNC_MODE", DEFAULT_SYNC_MODE)
+    label = _user_label(user)
     try:
         progress_by_item = get_abs_progress(user_id)
         scheduler_state = _scheduler_store.get(user_id)
@@ -1131,8 +1135,7 @@ def _poll_user(user: dict, now: datetime | None = None):
                         # Removed from ABS since it finished. Waiting for it
                         # would block every other book's daily run forever.
                         logger.warning("[%s] Daily sync: ABS item %s is gone; dropping it", label, item_id)
-            with _status_cache_lock:
-                _status_cache[user_id] = {"books": scoped_books, "abs_ok": True, "ts": time.time()}
+            _cache_books(user_id, scope, scoped_books)
 
         selected = _frequent_sync_candidates(user_id, scoped_books) if mode == "frequent" else []
         by_item = {_book_state_key(book): book for book in selected}
@@ -1148,7 +1151,6 @@ def _poll_user(user: dict, now: datetime | None = None):
                     by_item[item_id] = book
 
         lifecycle_books = list(by_item.values())
-        lifecycle_results = []
         if lifecycle_books:
             start_before_finish = {
                 item_id
@@ -1159,6 +1161,7 @@ def _poll_user(user: dict, now: datetime | None = None):
                 user_id,
                 lifecycle_books,
                 start_before_finish=start_before_finish,
+                label=label,
             )
             for book, result in zip(lifecycle_books, lifecycle_results):
                 item_id = book.get("abs_item_id")
@@ -1168,15 +1171,13 @@ def _poll_user(user: dict, now: datetime | None = None):
             logger.info("[%s] Auto-sync: %d/%d synced", label, synced, len(lifecycle_books))
 
         if scheduled_run:
-            daily_client = StoryGraphClient(
-                cfg(user_id, "STORYGRAPH_SESSION"),
-                cfg(user_id, "STORYGRAPH_REMEMBER_TOKEN"),
-            )
+            daily_client = _storygraph_client(user_id)
             status_results = do_sync(
                 user_id,
                 scoped_books,
                 write_progress=False,
                 client=daily_client,
+                label=label,
             ) if scoped_books else []
             # Judge each book on its own. A book StoryGraph has no audio
             # edition for will never match on a retry, so it is skipped rather
@@ -1221,33 +1222,31 @@ def _poll_user(user: dict, now: datetime | None = None):
 def _poll_loop():
     logger.info("Auto-sync started: polling every %ds, threshold %.1f min", POLL_INTERVAL, SYNC_THRESHOLD)
     while True:
-        time.sleep(POLL_INTERVAL)
         for user in list_users():
-            _poll_user(user)
+            with _user_lock(user["id"]):
+                _poll_user(user)
+        time.sleep(POLL_INTERVAL)
 
 # ── Flask app ─────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
 app.secret_key = _get_secret_key()
-# `flask run --reload` only restarts the process on .py changes, which
-# incidentally picks up fresh templates too. A template-only edit never
-# triggers that restart, so Jinja's cached template would otherwise go stale
-# until something else causes a restart. Unconditional (not tied to
-# READ_ONLY) — toggling that for write testing shouldn't also silently break
-# template hot-reload, which is exactly what happened when this was gated on
-# it. Negligible cost (an mtime check per render) for a low-traffic
-# self-hosted tool, on or off.
+# `flask run --reload` only watches .py files; this picks up template-only
+# edits too, for the cost of an mtime check per render.
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 
-# Trust one hop of X-Forwarded-Proto/Host/For/Prefix from a reverse proxy in
-# front of the container (Caddy, nginx, Traefik, ...). Without this, Flask has
-# no way to know the original request came in over https when the proxy talks
-# plain http to the container — so url_for(..., _external=True) (used to build
-# the OIDC redirect_uri sent to the provider) generates an http:// URL even
-# behind an https-terminating proxy, which providers like Google reject as a
-# redirect_uri mismatch. Setting the proxy's forwarded headers alone doesn't
-# fix this on its own — Flask/Werkzeug ignore them unless told to trust them,
-# which is what this does.
+
+@app.context_processor
+def _asset_url():
+    """url_for('static') with the file's mtime appended, so a browser never
+    runs a cached copy of the script or styles after an update."""
+    def asset_url(filename: str) -> str:
+        mtime = int(os.path.getmtime(os.path.join(app.static_folder, filename)))
+        return url_for("static", filename=filename, v=mtime)
+    return {"asset_url": asset_url}
+
+# Trust one hop of X-Forwarded-* from a reverse proxy, so the OIDC redirect_uri
+# built by url_for(..., _external=True) is https:// behind a TLS-terminating proxy.
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
 oauth = OAuth(app)
@@ -1274,7 +1273,7 @@ def needs_abs_item(*required_cfg: str, writes: bool = False):
                 return jsonify({"error": "This is disabled in read-only development mode"}), 403
             if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", item_id):
                 return jsonify({"error": "Invalid Audiobookshelf item ID"}), 400
-            missing = [k for k in required_cfg if not cfg(g.user["id"], k)]
+            missing = _missing_cfg(g.user["id"], required_cfg)
             if missing:
                 return jsonify({"error": f"Missing: {', '.join(missing)}"}), 400
             return view(item_id, *args, **kwargs)
@@ -1301,7 +1300,7 @@ def load_user():
         g.user = get_user(user_id)
         if g.user is None:
             session.clear()
-    if not any_users_exist():
+    if g.user is None and not any_users_exist():
         if request.endpoint != "setup":
             return redirect(url_for("setup"))
         return
@@ -1386,11 +1385,11 @@ def index():
 @app.route("/api/status")
 def api_status():
     user_id = g.user["id"]
-    scope = cfg(user_id, "SYNC_SCOPE", "in_progress")
+    scope = cfg(user_id, "SYNC_SCOPE", DEFAULT_SYNC_SCOPE)
     books, abs_ok = [], False
-    if cfg(user_id, "ABS_URL") and cfg(user_id, "ABS_TOKEN"):
+    if not _missing_cfg(user_id, ABS_KEYS):
         books, abs_ok = get_cached_books(user_id, scope)
-    mode = cfg(user_id, "SYNC_MODE", "frequent")
+    mode = cfg(user_id, "SYNC_MODE", DEFAULT_SYNC_MODE)
     last = {
         _book_state_key(book): synced_minutes
         for book in books
@@ -1417,38 +1416,34 @@ def api_sync():
     user_id = g.user["id"]
     if READ_ONLY:
         return jsonify({"error": "Sync is disabled in read-only development mode"}), 403
-    missing = [k for k in ("ABS_URL", "ABS_TOKEN", "STORYGRAPH_SESSION") if not cfg(user_id, k)]
+    missing = _missing_cfg(user_id, SYNC_KEYS)
     if missing:
-        return jsonify({"error": f"Missing: {', '.join(missing)}"}), 500
-    scope = cfg(user_id, "SYNC_SCOPE", "in_progress")
+        return jsonify({"error": f"Missing: {', '.join(missing)}"}), 400
+    scope = cfg(user_id, "SYNC_SCOPE", DEFAULT_SYNC_SCOPE)
+    label = _user_label(g.user)
     try:
         books = get_abs_books(user_id, scope)
         if not books:
             return jsonify({"message": "No books found", "synced": 0, "total": 0, "results": []})
-        results = do_sync(user_id, books)
+        with _user_lock(user_id):
+            results = do_sync(user_id, books, label=label)
         synced = sum(1 for r in results if r["status"] == "success")
         return jsonify({"message": "Sync complete", "synced": synced, "total": len(books), "results": results})
     except Exception as e:
-        logger.error("Sync failed: %s", e)
+        logger.error("[%s] Sync failed: %s", label, e)
         return jsonify({"error": str(e)}), 500
 
 
 def _resolve_abs_book(user_id: str, item_id: str) -> dict | None:
-    """Find a book's ABS metadata: from the cached /api/status list (which has
-    the complete per-item runtime) if present, else a direct fetch."""
-    scope = cfg(user_id, "SYNC_SCOPE", "in_progress")
-    books, _ = get_cached_books(user_id, scope)
+    """Find a book's ABS metadata: from the /api/status list if it's already
+    cached, else a direct fetch of just this item (never a whole-scope refresh)."""
+    books = _fresh_cached_books(user_id, cfg(user_id, "SYNC_SCOPE", DEFAULT_SYNC_SCOPE)) or []
     book = next((candidate for candidate in books if candidate.get("abs_item_id") == item_id), None)
     if book:
         return book
     item = _abs_get(user_id, f"/api/items/{item_id}").json()
-    progress_resp = req.get(
-        f"{cfg(user_id, 'ABS_URL')}/api/me/progress/{item_id}",
-        headers=_abs_headers(user_id),
-        timeout=10,
-    )
-    progress = progress_resp.json() if progress_resp.status_code == 200 else {}
-    return _item_to_book(item, progress)
+    progress_resp = _abs_get(user_id, f"/api/me/progress/{item_id}", required=False)
+    return _item_to_book(item, progress_resp.json() if progress_resp is not None else {})
 
 
 @app.route("/api/history-preview/<item_id>")
@@ -1471,7 +1466,6 @@ def api_history_preview(item_id):
                 "progress_percent": book["progress_percent"],
             },
             **preview,
-            "read_only": True,
         })
     except req.RequestException as exc:
         logger.warning("ABS history preview failed for %s: %s", item_id, exc)
@@ -1532,7 +1526,7 @@ def api_history_import_preview(item_id):
         sessions = get_abs_listening_sessions(user_id, item_id)
         preview = build_history_preview(sessions, book["duration_minutes"])
 
-        client = StoryGraphClient(cfg(user_id, "STORYGRAPH_SESSION"), cfg(user_id, "STORYGRAPH_REMEMBER_TOKEN"))
+        client = _storygraph_client(user_id)
         book_state = _import_store.get(user_id).get(item_id) or {}
 
         matched_edition = _saved_edition(user_id, item_id)
@@ -1546,11 +1540,10 @@ def api_history_import_preview(item_id):
             )
             if matched:
                 matched_edition = _edition_json(matched)
-                # Persist the auto-match now, same as a manual pick, so the write
-                # route (and a rerun of this preview) can find it without
-                # re-searching — and so it stays fixed even if a later search
-                # would land somewhere else.
-                _save_edition(user_id, item_id, matched_edition, source="auto")
+                # Persisted so the write route uses exactly this edition, even
+                # if a later search would land elsewhere.
+                with _user_lock(user_id):
+                    _save_edition(user_id, item_id, matched_edition, source="auto")
             else:
                 candidates = [_edition_json(c) for c in editions if c.is_audio]
 
@@ -1600,7 +1593,7 @@ def api_history_import_edition(item_id):
     storygraph_book_id = match.group(1)
 
     try:
-        client = StoryGraphClient(cfg(user_id, "STORYGRAPH_SESSION"), cfg(user_id, "STORYGRAPH_REMEMBER_TOKEN"))
+        client = _storygraph_client(user_id)
         html = client.get_book_page(storygraph_book_id)
         if not html or "/sign_in" in html[:200]:
             return jsonify({"error": "Could not reach that StoryGraph book"}), 400
@@ -1608,16 +1601,16 @@ def api_history_import_edition(item_id):
         logger.warning("Manual edition lookup failed for %s: %s", storygraph_book_id, exc)
         return jsonify({"error": "Could not reach StoryGraph"}), 502
 
-    # Title comes from the page just fetched to validate the id — the edition's
-    # format and runtime aren't on a book page, so they stay unknown for a
-    # hand-picked edition and the UI simply omits them.
-    _save_edition(user_id, item_id, {
-        "storygraph_book_id": storygraph_book_id,
-        "title": _storygraph_page_title(html),
-        "format": None,
-        "duration_minutes": None,
-        "identifier": None,
-    }, source="manual")
+    # A book page has the title but not the format or runtime, so those stay
+    # unknown for a hand-picked edition.
+    with _user_lock(user_id):
+        _save_edition(user_id, item_id, {
+            "storygraph_book_id": storygraph_book_id,
+            "title": _storygraph_page_title(html),
+            "format": None,
+            "duration_minutes": None,
+            "identifier": None,
+        }, source="manual")
     return jsonify({"ok": True, "storygraph_book_id": storygraph_book_id})
 
 
@@ -1655,20 +1648,21 @@ def api_history_import(item_id):
         return jsonify({"error": "Could not load listening history from Audiobookshelf"}), 502
     checkpoints = _history_checkpoints(sessions, book["duration_minutes"])
 
-    label = (get_user(user_id) or {}).get("username") or user_id
+    label = _user_label(g.user)
     try:
-        client = StoryGraphClient(cfg(user_id, "STORYGRAPH_SESSION"), cfg(user_id, "STORYGRAPH_REMEMBER_TOKEN"))
+        client = _storygraph_client(user_id)
         if not client.check_auth():
             return jsonify({"error": "StoryGraph session invalid — update it in Settings"}), 401
-        results = _reconcile_history_checkpoints(
-            user_id,
-            item_id,
-            storygraph_book_id,
-            checkpoints,
-            requested,
-            client,
-            label,
-        )
+        with _user_lock(user_id):
+            results = _reconcile_history_checkpoints(
+                user_id,
+                item_id,
+                storygraph_book_id,
+                checkpoints,
+                requested,
+                client,
+                label,
+            )
     except HistoryReconcileError as exc:
         return jsonify({"error": str(exc)}), 502
     except req.RequestException as exc:
@@ -1714,7 +1708,9 @@ def api_settings():
         except (TypeError, ZoneInfoNotFoundError):
             return jsonify({"error": "Invalid TIMEZONE"}), 400
     set_cfg(user_id, {k: v for k, v in data.items() if k in allowed})
-    logger.info("[%s] Settings updated via UI", g.user.get("username") or g.user.get("display_name") or user_id)
+    with _status_cache_lock:
+        _status_cache.pop(user_id, None)
+    logger.info("[%s] Settings updated via UI", _user_label(g.user))
     return jsonify({"ok": True})
 
 
@@ -1727,8 +1723,8 @@ def api_settings_get():
         "ABS_TOKEN": "set" if cfg(user_id, "ABS_TOKEN") else "",
         "STORYGRAPH_SESSION": "set" if cfg(user_id, "STORYGRAPH_SESSION") else "",
         "STORYGRAPH_REMEMBER_TOKEN": "set" if cfg(user_id, "STORYGRAPH_REMEMBER_TOKEN") else "",
-        "SYNC_SCOPE": cfg(user_id, "SYNC_SCOPE", "in_progress"),
-        "SYNC_MODE": cfg(user_id, "SYNC_MODE", "frequent"),
+        "SYNC_SCOPE": cfg(user_id, "SYNC_SCOPE", DEFAULT_SYNC_SCOPE),
+        "SYNC_MODE": cfg(user_id, "SYNC_MODE", DEFAULT_SYNC_MODE),
         "DAILY_SYNC_TIME": cfg(user_id, "DAILY_SYNC_TIME", DEFAULT_DAILY_SYNC_TIME),
         "TIMEZONE": cfg(user_id, "TIMEZONE", DEFAULT_TIMEZONE),
     })

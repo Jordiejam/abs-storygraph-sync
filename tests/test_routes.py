@@ -399,7 +399,7 @@ class EditionOverrideTests(_ImportRouteCase):
         fake = FakeStoryGraph()
         fake.ensure_status = lambda book_id, status: (posted.append(("status", book_id)), (True, False, None))[1]
         fake.update_progress = lambda book_id, pct, html=None: posted.append(("progress", book_id)) or True
-        fake._parse_current_progress = lambda html: None
+        fake.parse_current_progress = lambda html: None
         A.StoryGraphClient = lambda *a, **k: fake
 
         results = A.do_sync(user_id, [dict(self.book)])
@@ -419,7 +419,7 @@ class EditionOverrideTests(_ImportRouteCase):
         fake = FakeStoryGraph()
         fake.ensure_status = lambda book_id, status: (posted.append(book_id), (True, False, None))[1]
         fake.update_progress = lambda book_id, pct, html=None: posted.append(book_id) or True
-        fake._parse_current_progress = lambda html: None
+        fake.parse_current_progress = lambda html: None
         A.StoryGraphClient = lambda *a, **k: fake
 
         A.do_sync(user_id, [dict(self.book)])
@@ -435,12 +435,26 @@ class EditionOverrideTests(_ImportRouteCase):
         fake = FakeStoryGraph()
         fake.ensure_status = lambda book_id, status: (statuses.append(status), (True, False, None))[1]
         fake.update_progress = lambda book_id, pct, html=None: True
-        fake._parse_current_progress = lambda html: None
+        fake.parse_current_progress = lambda html: None
         A.StoryGraphClient = lambda *a, **k: fake
 
         results = A.do_sync(user_id, [finished_book], start_before_finish={self.ITEM})
         self.assertEqual(["success"], [result["status"] for result in results])
         self.assertEqual(["currently-reading", "read"], statuses)
+
+
+class AdminPageTests(_ImportRouteCase):
+    def test_non_admins_get_no_admin_markup_and_no_admin_api(self):
+        self.assertIn("log-box", self.client.get("/").get_data(as_text=True))
+
+        A.create_user(username="plain", password="pw")
+        self.client.get("/logout")
+        self.client.post("/login", data={"username": "plain", "password": "pw"})
+        html = self.client.get("/").get_data(as_text=True)
+        self.assertNotIn("users-list", html)
+        self.assertNotIn("log-box", html)
+        self.assertEqual(403, self.client.get("/api/logs").status_code)
+        self.assertEqual(403, self.client.get("/api/users").status_code)
 
 
 class SyncSettingsTests(_ImportRouteCase):

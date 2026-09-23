@@ -15,7 +15,6 @@ import types
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 os.environ.setdefault("DATA_DIR", tempfile.mkdtemp(prefix="abs-sg-tests-"))
-os.environ.setdefault("SECRET_KEY", "test-secret-key")
 
 try:
     import authlib.integrations.flask_client  # noqa: F401
