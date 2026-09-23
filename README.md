@@ -14,7 +14,7 @@ Runs as a lightweight Docker container alongside ABS. No browser automation — 
 - Web UI to manage credentials, view logs, and trigger a manual sync
 - Progress is only pushed to StoryGraph when it actually changes (no duplicate journal entries)
 - Matches the closest audiobook edition using ISBN/ASIN when available and the ABS runtime
-- Daily history reconstructed from Audiobookshelf playback sessions, with a read-only preview and an opt-in History Import that backdates StoryGraph journal entries
+- Daily history reconstructed from Audiobookshelf playback sessions, shown day by day for review before an opt-in History Import that backdates StoryGraph journal entries
 - Accounts, settings, and sync state persist across restarts
 
 ## Setup

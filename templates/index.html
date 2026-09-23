@@ -16,8 +16,8 @@
   </div>
   <div class="header-right">
     <div class="pills">
-      <div class="pill"><div class="dot" id="d-abs"></div><span id="l-abs">ABS</span></div>
-      <div class="pill"><div class="dot" id="d-sg"></div><span id="l-sg">StoryGraph</span></div>
+      <div class="pill"><div class="dot" id="d-abs"></div><span>ABS</span></div>
+      <div class="pill"><div class="dot" id="d-sg"></div><span>StoryGraph</span></div>
       <div class="pill"><div class="dot ok" id="d-poll"></div><span id="l-poll">Auto-sync</span></div>
     </div>
     <span class="header-user">{{ display_name }}</span>
@@ -43,18 +43,10 @@
 
   <div class="card" id="history-card" style="display:none">
     <div class="section-header">
-      <h2 id="history-title">History Preview</h2>
+      <h2 id="history-title">History</h2>
       <button class="btn btn-ghost" onclick="closeHistory()">Close</button>
     </div>
     <div id="history-content"></div>
-  </div>
-
-  <div class="card" id="import-card" style="display:none">
-    <div class="section-header">
-      <h2 id="import-title">Import History</h2>
-      <button class="btn btn-ghost" onclick="closeImport()">Close</button>
-    </div>
-    <div id="import-content"></div>
   </div>
 
   <!-- Settings -->

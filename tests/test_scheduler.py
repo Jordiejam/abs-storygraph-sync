@@ -276,9 +276,6 @@ class SchedulerTests(unittest.TestCase):
             def ensure_status(self, book_id, status, html=None):
                 return status_ok, True, ""
 
-            def parse_current_progress(self, html):
-                return None
-
             def get_logged_progress_dates(self, book_id):
                 return {date for (logged_id, date) in sg["journal"] if logged_id == book_id}
 
