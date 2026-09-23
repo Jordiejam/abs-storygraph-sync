@@ -73,11 +73,6 @@ class FakeStoryGraph:
         self.calls.append(("load_editions", title))
         return list(FakeStoryGraph.editions)
 
-    def match_audio_edition(self, candidates, title, duration_minutes=0, identifiers=None):
-        return A.choose_audio_edition(
-            candidates, target_duration_minutes=duration_minutes, identifiers=identifiers or []
-        )
-
     def get_logged_progress_dates(self, book_id):
         self.calls.append(("journal", book_id))
         return {d for d, pct in FakeStoryGraph.journal.items() if pct is not None}
@@ -185,6 +180,14 @@ class ImportPreviewTests(_ImportRouteCase):
         self.assertIsNone(data["matched_edition"])
         self.assertEqual([OTHER_ID], [c["storygraph_book_id"] for c in data["candidates"]])
 
+    def test_preview_without_a_storygraph_session_is_history_only(self):
+        A._config_store.get(self.user["id"]).pop("STORYGRAPH_SESSION")
+        data = self.preview()
+        self.assertFalse(data["storygraph_ready"])
+        self.assertIsNone(data["matched_edition"])
+        self.assertEqual(3, len(data["days"]))
+        self.assertEqual([], FakeStoryGraph.instances, "no StoryGraph session means no StoryGraph calls")
+
     def test_preview_does_not_treat_a_status_only_entry_as_already_logged(self):
         FakeStoryGraph.journal = {"2026-01-06": None}
         days = self.preview()["days"]
@@ -212,6 +215,7 @@ class ImportWriteTests(_ImportRouteCase):
             [dict(self.book)],
             write_progress=False,
             client=client,
+            label="jordan",
         )
 
         self.assertEqual("success", result[0]["status"])
@@ -352,9 +356,13 @@ class ImportInputTrustTests(_ImportRouteCase):
     def test_rejects_a_malformed_item_id_and_missing_configuration(self):
         self.assertEqual(400, self.client.get("/api/history-import-preview/!!bad!!").status_code)
         A._config_store.get(self.user["id"])["STORYGRAPH_SESSION"] = ""
-        r = self.client.get(f"/api/history-import-preview/{self.ITEM}")
+        r = self.client.post(f"/api/history-import/{self.ITEM}", json={"days": ["2026-01-05@60.0"]})
         self.assertEqual(400, r.status_code)
         self.assertIn("STORYGRAPH_SESSION", r.get_json()["error"])
+        A._config_store.get(self.user["id"])["ABS_TOKEN"] = ""
+        r = self.client.get(f"/api/history-import-preview/{self.ITEM}")
+        self.assertEqual(400, r.status_code)
+        self.assertIn("ABS_TOKEN", r.get_json()["error"])
 
     def test_read_only_mode_blocks_the_write_but_not_the_preview(self):
         self.all_keys()
@@ -399,10 +407,9 @@ class EditionOverrideTests(_ImportRouteCase):
         fake = FakeStoryGraph()
         fake.ensure_status = lambda book_id, status: (posted.append(("status", book_id)), (True, False, None))[1]
         fake.update_progress = lambda book_id, pct, html=None: posted.append(("progress", book_id)) or True
-        fake.parse_current_progress = lambda html: None
         A.StoryGraphClient = lambda *a, **k: fake
 
-        results = A.do_sync(user_id, [dict(self.book)])
+        results = A.do_sync(user_id, [dict(self.book)], label="jordan")
         self.assertEqual(["success"], [r["status"] for r in results])
         self.assertEqual({OTHER_ID}, {book_id for _, book_id in posted})
         self.assertEqual(OTHER_ID, A._sync_store.get(user_id)[self.ITEM]["storygraph_book_id"])
@@ -419,10 +426,9 @@ class EditionOverrideTests(_ImportRouteCase):
         fake = FakeStoryGraph()
         fake.ensure_status = lambda book_id, status: (posted.append(book_id), (True, False, None))[1]
         fake.update_progress = lambda book_id, pct, html=None: posted.append(book_id) or True
-        fake.parse_current_progress = lambda html: None
         A.StoryGraphClient = lambda *a, **k: fake
 
-        A.do_sync(user_id, [dict(self.book)])
+        A.do_sync(user_id, [dict(self.book)], label="jordan")
         self.assertEqual({OTHER_ID}, set(posted), "an auto match must not hijack a synced book")
 
     def test_short_reread_writes_start_before_the_unchanged_finish(self):
@@ -435,10 +441,9 @@ class EditionOverrideTests(_ImportRouteCase):
         fake = FakeStoryGraph()
         fake.ensure_status = lambda book_id, status: (statuses.append(status), (True, False, None))[1]
         fake.update_progress = lambda book_id, pct, html=None: True
-        fake.parse_current_progress = lambda html: None
         A.StoryGraphClient = lambda *a, **k: fake
 
-        results = A.do_sync(user_id, [finished_book], start_before_finish={self.ITEM})
+        results = A.do_sync(user_id, [finished_book], label="jordan", start_before_finish={self.ITEM})
         self.assertEqual(["success"], [result["status"] for result in results])
         self.assertEqual(["currently-reading", "read"], statuses)
 

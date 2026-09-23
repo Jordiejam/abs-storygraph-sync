@@ -11,7 +11,7 @@ WORKDIR /app
 
 COPY --from=builder /install /usr/local
 
-COPY app.py matcher.py history.py journal.py ./
+COPY *.py ./
 COPY templates/ templates/
 COPY static/ static/
 
