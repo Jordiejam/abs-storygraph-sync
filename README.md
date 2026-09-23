@@ -8,13 +8,13 @@ Runs as a lightweight Docker container alongside ABS. No browser automation — 
 
 - Multi-user: everyone gets their own account, ABS/StoryGraph credentials, and sync state
 - Login via local username/password, or SSO through any OIDC provider (e.g. [PocketID](https://github.com/pocket-id/pocket-id))
-- Configurable auto-sync frequency: every 10 minutes, or a daily history reconciliation at a chosen local time
+- Configurable auto-sync frequency: every `POLL_INTERVAL` (10 minutes by default), or a daily history reconciliation at a chosen local time
 - Book starts and finishes sync promptly even when ordinary progress is set to daily
 - Configurable sync scope: just in-progress books, in-progress + finished, or your entire library
 - Web UI to manage credentials, view logs, and trigger a manual sync
 - Progress is only pushed to StoryGraph when it actually changes (no duplicate journal entries)
 - Matches the closest audiobook edition using ISBN/ASIN when available and the ABS runtime
-- Read-only daily history preview reconstructed from Audiobookshelf playback sessions
+- Daily history reconstructed from Audiobookshelf playback sessions, with a read-only preview and an opt-in History Import that backdates StoryGraph journal entries
 - Accounts, settings, and sync state persist across restarts
 
 ## Setup
@@ -28,23 +28,8 @@ git clone --branch feature/edition-aware-matcher https://github.com/Jordiejam/ab
 cd abs-storygraph-sync
 ```
 
-```yaml
-services:
-  abs-storygraph-sync:
-    build: .
-    image: abs-storygraph-sync:local
-    restart: unless-stopped
-    ports:
-      - "${WEB_PORT:-5465}:5465"
-    volumes:
-      - ./data:/app/data
-    environment:
-      PORT: "5465"
-      # Optional: enable "Sign in with SSO" for any OIDC provider (e.g. PocketID)
-      # OIDC_ISSUER: https://id.example.com
-      # OIDC_CLIENT_ID: your_client_id
-      # OIDC_CLIENT_SECRET: your_client_secret
-```
+The included [`docker-compose.yml`](docker-compose.yml) builds the image and persists
+everything under `./data`; uncomment its OIDC and `PUBLIC_URL` lines if you need them.
 
 ```sh
 docker compose up -d --build
@@ -74,7 +59,7 @@ file:
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 ```
 
-Python files and templates are bind-mounted into the container and Flask
+Python files, templates and static assets are bind-mounted into the container and Flask
 reloads them when they change, so routine source changes only need a `git pull`,
 not an image rebuild. Development mode is explicitly read-only: the background
 poller is stopped and the manual sync endpoint is blocked. Rebuild only after a
@@ -134,7 +119,7 @@ Each user picks how much of their library to sync, in **Settings**:
 
 Each user can choose:
 
-- **Every 10 Minutes** (default) — progress is pushed after at least `SYNC_THRESHOLD_MINUTES` of additional listening
+- **Every N Minutes** (default, N from `POLL_INTERVAL`) — progress is pushed after at least `SYNC_THRESHOLD_MINUTES` of additional listening
 - **Daily** — at the selected local time (midnight by default), completed Audiobookshelf listening days are reconciled to dated StoryGraph progress entries
 
 The app still checks Audiobookshelf every `POLL_INTERVAL` seconds in Daily mode, but only contacts StoryGraph when a book starts, a book finishes, the daily run is due, or the user selects **Sync Now**. At midnight, it reconciles the previous day's ABS checkpoint using the same duplicate-safe, verified write path as History Import, so the entry keeps the day the listening happened. After downtime it catches up missed completed days; the first daily run only considers yesterday and never sweeps older history automatically. Finished books are retained until that final listening day has been checked. The first check after enabling this version quietly records existing books so old starts and finishes are not replayed.

@@ -13,6 +13,7 @@ COPY --from=builder /install /usr/local
 
 COPY app.py matcher.py history.py journal.py ./
 COPY templates/ templates/
+COPY static/ static/
 
 ENV PORT=5465 \
     PYTHONDONTWRITEBYTECODE=1 \
