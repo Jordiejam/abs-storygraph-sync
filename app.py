@@ -431,17 +431,31 @@ def _match_audio_edition(candidates, title, duration_minutes=0, identifiers=None
     return matched
 
 
+def _input_value(html: str, name: str) -> str | None:
+    """The value of the named <input>, whatever order its attributes come in."""
+    for tag in re.findall(r"<input\b[^>]*>", html):
+        if f'name="{name}"' in tag:
+            m = re.search(r'\bvalue="([^"]*)"', tag)
+            return m.group(1) if m else None
+    return None
+
+
+def _parse_read_status(html: str) -> str:
+    """The status label on a book page ("currently reading", "read", ...), or
+    "" if it can't be found. The label carries a long list of utility classes,
+    so match read-status-label as one class token among them."""
+    m = re.search(r'class="(?:[^"]*\s)?read-status-label(?:\s[^"]*)?"[^>]*>([^<]+)<', html)
+    return " ".join(m.group(1).split()).lower() if m else ""
+
+
 def _parse_current_progress(html) -> float | None:
     """The percentage StoryGraph has on file for this book, or None if it
     can't be read — treat that as unknown, never as a reason to skip a write."""
-    m = re.search(
-        r'(?:name="read_status\[progress_number\]"|class="read-status-progress-number")[^>]*value="([^"]*)"',
-        html,
-    )
-    if not m or not m.group(1):
+    value = _input_value(html, "read_status[progress_number]")
+    if not value:
         return None
     try:
-        return float(m.group(1))
+        return float(value)
     except ValueError:
         return None
 
@@ -552,10 +566,13 @@ class StoryGraphClient:
         the page markup the match was read from (reusable for a progress check), or None
         if a status-changing POST was made and any previously-fetched markup is now stale."""
         html = html if html is not None else self.get_book_page(book_id)
-        m = re.search(r'class="read-status-label"[^>]*>([^<]+)<', html)
-        current = m.group(1).strip().lower() if m else ""
-        label = _STATUS_LABELS[target_status]
-        if label in current or (target_status == "currently-reading" and "rereading" in current):
+        current = _parse_read_status(html)
+        # Exact match: "read" is a substring of "currently reading". Re-posting
+        # the status a book already has is not a no-op on StoryGraph — it appears
+        # to wipe the book's current progress, which the daily run never rewrites.
+        if current == _STATUS_LABELS[target_status] or (
+            target_status == "currently-reading" and "rereading" in current
+        ):
             return True, True, html
         r = self._post(
             f"/update-status.js?book_id={book_id}&status={target_status}",
@@ -566,11 +583,7 @@ class StoryGraphClient:
 
     def update_progress(self, book_id, progress_percent, html: str | None = None) -> bool:
         html = html if html is not None else self.get_book_page(book_id)
-        m = re.search(
-            r'(?:name="read_status\[book_num_of_pages\]"|class="read-status-book-num-of-pages")[^>]*value="([^"]*)"',
-            html,
-        )
-        book_pages = m.group(1) if m else "0"
+        book_pages = _input_value(html, "read_status[book_num_of_pages]") or "0"
         r = self._post("/update-progress", {
             "read_status[progress_number]": str(round(progress_percent, 1)),
             "read_status[progress_type]": "percentage",
