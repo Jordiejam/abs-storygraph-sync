@@ -88,3 +88,38 @@ class HelperTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _book_page(label, progress=None):
+    """Book-page markup shaped like StoryGraph's: the label carries a long run
+    of utility classes, and the progress input puts its value before its name."""
+    value = f' value="{progress}"' if progress is not None else ""
+    return (
+        '<button class="read-status-label text-cyan-700 text-sm font-medium w-full" '
+        f'title="Book marked as {label}">{label}</button>'
+        f'<input min="0" max="100"{value} class=" read-status-progress-number bg-transparent" '
+        'type="number" name="read_status[progress_number]" id="read_status_progress_number" />'
+    )
+
+
+class StoryGraphPageTests(unittest.TestCase):
+    def setUp(self):
+        self.client = A.StoryGraphClient("session")
+        self.posts = []
+        self.client._post = lambda path, data: self.posts.append(path) or _FakeResponse({})
+
+    def test_a_matching_status_is_not_posted_again(self):
+        ok, already, html = self.client.ensure_status("b1", "currently-reading", html=_book_page("currently reading", 89))
+
+        self.assertEqual((True, True), (ok, already))
+        self.assertEqual([], self.posts)
+        self.assertEqual(89.0, A._parse_current_progress(html))
+
+    def test_currently_reading_does_not_count_as_read(self):
+        ok, already, _ = self.client.ensure_status("b1", "read", html=_book_page("currently reading"))
+
+        self.assertEqual((True, False), (ok, already))
+        self.assertEqual(["/update-status.js?book_id=b1&status=read"], self.posts)
+
+    def test_cleared_progress_reads_as_unknown(self):
+        self.assertIsNone(A._parse_current_progress(_book_page("currently reading")))
