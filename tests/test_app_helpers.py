@@ -101,6 +101,27 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(["Ray Porter", "Someone Else"], book["narrators"])
         self.assertEqual(("Audible Studios", "English"), (book["publisher"], book["language"]))
 
+    def test_reads_the_storygraph_tag_off_an_abs_book(self):
+        book_id = "A810EEFF-D332-4B69-A85B-9FB99D2C4936"
+        book = A._item_to_book({"id": "item-1", "media": {
+            "duration": 60, "metadata": {"title": "Book"}, "tags": ["Fantasy", f"StoryGraph: {book_id}"],
+        }}, {})
+        self.assertEqual(book_id.lower(), book["storygraph_tag"])
+        self.assertIsNone(A._item_to_book(_item("item-2"), {})["storygraph_tag"])
+
+    def test_writing_a_tag_replaces_the_old_one_and_keeps_the_rest(self):
+        old_id, new_id = "a" * 36, "b" * 36
+        item = {"media": {"tags": ["Fantasy", f"storygraph:{old_id}"]}}
+        patches = []
+        with mock.patch.object(A.req, "get", lambda url, **kwargs: _FakeResponse(item)), \
+                mock.patch.object(A.req, "patch", lambda url, **kwargs: patches.append((url, kwargs["json"])) or _FakeResponse({})):
+            self.assertTrue(A.write_storygraph_tag(self.USER_ID, "item-1", new_id))
+            item["media"]["tags"] = ["Fantasy", f"storygraph:{new_id}"]
+            self.assertFalse(A.write_storygraph_tag(self.USER_ID, "item-1", new_id))
+        self.assertEqual(
+            [("http://abs/api/items/item-1/media", {"tags": ["Fantasy", f"storygraph:{new_id}"]})], patches,
+        )
+
     def test_a_missing_abs_item_is_none_rather_than_an_error(self):
         with mock.patch.object(A.req, "get", lambda url, **kwargs: _FakeResponse({}, 404)):
             self.assertIsNone(A.get_abs_book(self.USER_ID, "gone", {}))

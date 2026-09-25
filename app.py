@@ -22,8 +22,8 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
 from authlib.integrations.flask_client import OAuth
 from matcher import (
-    AudiobookDetails, edition_checks, match_audio_edition, merge_editions, normalise_language,
-    parse_filtered_editions, parse_storygraph_editions,
+    AudiobookDetails, EditionCandidate, edition_checks, match_audio_edition, merge_editions,
+    normalise_language, parse_filtered_editions, parse_storygraph_editions,
 )
 from history import build_history_preview, day_key
 from journal import parse_journal_page, progress_dates
@@ -358,6 +358,40 @@ def _abs_get(user_id: str, path: str, params: dict | None = None, *, required: b
     return resp
 
 
+# ABS has no custom fields, so a book's confirmed StoryGraph edition is kept on
+# it as a tag. See _storygraph_tag_id and write_storygraph_tag.
+STORYGRAPH_TAG_PREFIX = "storygraph:"
+_STORYGRAPH_TAG_RE = re.compile(rf"{STORYGRAPH_TAG_PREFIX}\s*([0-9a-fA-F-]{{36}})", re.IGNORECASE)
+
+
+def _storygraph_tag_id(tags) -> str | None:
+    """The StoryGraph book id from the first storygraph:<id> tag, if any."""
+    for tag in tags or []:
+        m = _STORYGRAPH_TAG_RE.fullmatch(str(tag).strip())
+        if m:
+            return m.group(1).lower()
+    return None
+
+
+def write_storygraph_tag(user_id: str, item_id: str, storygraph_book_id: str) -> bool:
+    """Tag the ABS book with its StoryGraph edition, replacing any older
+    storygraph: tag and keeping every other tag. Returns False when the tag
+    was already there. Needs an ABS user allowed to update books."""
+    tags = (_abs_get(user_id, f"/api/items/{item_id}").json().get("media") or {}).get("tags") or []
+    wanted = f"{STORYGRAPH_TAG_PREFIX}{storygraph_book_id}"
+    if wanted in tags:
+        return False
+    kept = [tag for tag in tags if not _storygraph_tag_id([tag])]
+    resp = req.patch(
+        f"{cfg(user_id, 'ABS_URL')}/api/items/{item_id}/media",
+        headers={"Authorization": f"Bearer {cfg(user_id, 'ABS_TOKEN')}"},
+        json={"tags": [*kept, wanted]},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return True
+
+
 def _item_to_book(item: dict, progress: dict) -> dict | None:
     media = item.get("media", {})
     metadata = media.get("metadata", {})
@@ -378,6 +412,7 @@ def _item_to_book(item: dict, progress: dict) -> dict | None:
         "narrators": [name.strip() for name in (metadata.get("narratorName") or "").split(",") if name.strip()],
         "publisher": metadata.get("publisher") or None,
         "language": metadata.get("language") or None,
+        "storygraph_tag": _storygraph_tag_id(media.get("tags")),
         "progress_percent": round((progress.get("progress") or 0) * 100, 1),
         "current_minutes": round((progress.get("currentTime") or 0) / 60, 1),
         "duration_minutes": round((media.get("duration") or 0) / 60, 1),
@@ -483,7 +518,7 @@ def _audiobook_details(book: dict) -> AudiobookDetails:
     )
 
 
-def _match_audio_edition(candidates, title, duration_minutes=0, identifiers=None, details=None):
+def _match_audio_edition(candidates, title, duration_minutes=0, identifiers=None, details=None, tagged_id=None):
     """The single confident audio-edition match from an already-loaded
     candidate list (full candidate, for display) or None, with the reason from
     matcher.match_audio_edition."""
@@ -492,6 +527,7 @@ def _match_audio_edition(candidates, title, duration_minutes=0, identifiers=None
         target_duration_minutes=duration_minutes,
         identifiers=identifiers or [],
         details=details,
+        tagged_id=tagged_id,
     )
     if matched:
         logger.info(
@@ -1586,6 +1622,19 @@ def _edition_json(candidate, details: AudiobookDetails | None = None) -> dict:
     }
 
 
+def _tagged_edition_title(client: StoryGraphClient, book_id: str) -> str:
+    """The title on a tagged edition's book page, or "" if it can't be read.
+    Only a label, so a failure here never stops the lookup."""
+    try:
+        html = client.get_book_page(book_id)
+    except req.RequestException as exc:
+        logger.warning("Could not read the tagged StoryGraph edition %s: %s", book_id, exc)
+        return ""
+    if not html or "/sign_in" in html[:200]:
+        return ""
+    return _storygraph_page_title(html) or ""
+
+
 def _storygraph_page_title(html: str) -> str | None:
     """Book title read from an already-fetched StoryGraph book page."""
     m = re.search(r"<title>([^<]+)</title>", html)
@@ -1601,13 +1650,23 @@ def _look_up_edition(user_id: str, client: StoryGraphClient, book: dict, query: 
     a person can pick a different edition."""
     search = query or f"{book['title']} {book['author']}".strip()
     editions = client.load_editions(search, normalise_language(book.get("language")) or None)
+    tagged_id = book.get("storygraph_tag")
+    tagged_unlisted = bool(tagged_id) and all(candidate.book_id != tagged_id for candidate in editions)
+    if tagged_unlisted:
+        # The search didn't turn up the edition ABS is tagged with, but it's
+        # still the one a person confirmed, so it's offered with what its book
+        # page says (only the title).
+        editions.append(EditionCandidate(tagged_id, _tagged_edition_title(client, tagged_id), "", None, None, None, None))
     details = _audiobook_details(book)
     matched, reason = _match_audio_edition(
         editions, book["title"],
         duration_minutes=book.get("duration_minutes", 0),
         identifiers=book.get("identifiers", []),
         details=details,
+        tagged_id=tagged_id,
     )
+    if tagged_unlisted:
+        reason["tagged_unlisted"] = True
     audio = [candidate for candidate in editions if candidate.is_audio]
     read = next((candidate for candidate in editions if candidate.read_by_you), None)
     if not matched and read:
@@ -1665,6 +1724,7 @@ def _edition_row(user_id: str, book: dict, entry: dict) -> dict:
         "narrators": book.get("narrators", []),
         "publisher": book.get("publisher"),
         "language": book.get("language"),
+        "storygraph_tag": book.get("storygraph_tag"),
         "progress_percent": book["progress_percent"],
         "is_finished": book["is_finished"],
         "state": entry.get("state", "unchecked"),
@@ -1854,12 +1914,7 @@ def api_edition_confirm(item_id):
         return jsonify({"error": "That doesn't look like a StoryGraph book id or URL"}), 400
     storygraph_book_id = match.group(1)
 
-    entry = _edition_entry(user_id, item_id)
-    known = [entry.get("edition"), *entry.get("candidates", [])]
-    edition = next(
-        (dict(e) for e in known if e and e.get("storygraph_book_id") == storygraph_book_id and e.get("title")),
-        None,
-    )
+    edition = _known_edition(_edition_entry(user_id, item_id), storygraph_book_id)
     if edition is None:
         try:
             html = _storygraph_client(user_id).get_book_page(storygraph_book_id)
@@ -1884,7 +1939,115 @@ def api_edition_confirm(item_id):
         entry.setdefault("candidates", [])
         _edition_store.save(user_id)
     logger.info("[%s] Confirmed StoryGraph edition %s for %s", _user_label(g.user), storygraph_book_id, item_id)
-    return jsonify({"ok": True, "state": "confirmed", "edition": edition})
+    return jsonify({
+        "ok": True, "state": "confirmed", "edition": edition,
+        "tag_error": _tag_confirmed_edition(user_id, item_id, storygraph_book_id),
+    })
+
+
+def _known_edition(entry: dict, storygraph_book_id: str) -> dict | None:
+    """This book's suggestion or one of its candidates, if it's that edition
+    and has its details (a title at least), so confirming it needs no fetch."""
+    known = [entry.get("edition"), *entry.get("candidates", [])]
+    return next(
+        (dict(e) for e in known if e and e.get("storygraph_book_id") == storygraph_book_id and e.get("title")),
+        None,
+    )
+
+
+def _tag_confirmed_edition(user_id: str, item_id: str, storygraph_book_id: str) -> str | None:
+    """Tag the ABS book with the edition just confirmed, so the next lookup
+    (from anyone, or after losing this app's data) starts from it. The
+    confirmation stands either way; this returns why tagging failed, if it did."""
+    if READ_ONLY or _missing_cfg(user_id, ABS_KEYS):
+        return None
+    try:
+        _write_tag_logged(user_id, item_id, storygraph_book_id)
+    except req.RequestException as exc:
+        return _tag_error(exc)
+    return None
+
+
+def _write_tag_logged(user_id: str, item_id: str, storygraph_book_id: str):
+    try:
+        if write_storygraph_tag(user_id, item_id, storygraph_book_id):
+            logger.info("Tagged ABS item %s with %s%s", item_id, STORYGRAPH_TAG_PREFIX, storygraph_book_id)
+    except req.RequestException as exc:
+        logger.warning("Could not tag ABS item %s with its StoryGraph edition: %s", item_id, exc)
+        raise
+
+
+def _tag_error(exc: req.RequestException) -> str:
+    if getattr(exc.response, "status_code", None) == 403:
+        return "Your Audiobookshelf user isn't allowed to update books, so editions can't be tagged there"
+    return "Could not tag the edition in Audiobookshelf"
+
+
+@app.route("/api/editions/sync-tags", methods=["POST"])
+def api_edition_tag_sync():
+    """Line up confirmed editions and ABS tags, both ways, across the whole
+    library: a book tagged in ABS but not confirmed here is confirmed as the
+    tagged edition, and a confirmed book without a tag gets one. A book
+    confirmed here as a different edition from its tag is left alone and
+    reported, since each was somebody's pick. Never touches StoryGraph."""
+    user_id = g.user["id"]
+    missing = _missing_cfg(user_id, ABS_KEYS)
+    if missing:
+        return jsonify({"error": f"Missing: {', '.join(missing)}"}), 400
+    try:
+        books = get_abs_books(user_id, "library")
+    except req.RequestException as exc:
+        logger.warning("Tag sync could not read ABS: %s", exc)
+        return jsonify({"error": "Could not load your library from Audiobookshelf"}), 502
+
+    confirmed, to_tag, conflicts = [], [], []
+    with _user_lock(user_id):
+        editions = _editions(user_id)
+        for book in books:
+            item_id, tagged_id = book["abs_item_id"], book.get("storygraph_tag")
+            confirmed_id = _confirmed_edition_id(user_id, item_id)
+            if tagged_id and not confirmed_id:
+                entry = editions.setdefault(item_id, {})
+                entry.update(
+                    state="confirmed",
+                    # A tag carries only the id; the details are kept when a
+                    # lookup already found this edition.
+                    edition=_known_edition(entry, tagged_id) or {
+                        "storygraph_book_id": tagged_id, "title": None, "format": None,
+                        "duration_minutes": None, "identifier": None,
+                    },
+                    confirmed_at=time.time(),
+                )
+                entry.setdefault("candidates", [])
+                confirmed.append(item_id)
+            elif confirmed_id and not tagged_id:
+                to_tag.append((item_id, confirmed_id))
+            elif tagged_id and tagged_id != confirmed_id:
+                conflicts.append(book["title"])
+        if confirmed:
+            _edition_store.save(user_id)
+
+    tagged, tag_error = 0, None
+    for item_id, storygraph_book_id in ([] if READ_ONLY else to_tag):
+        try:
+            _write_tag_logged(user_id, item_id, storygraph_book_id)
+            tagged += 1
+        except req.RequestException as exc:
+            tag_error = _tag_error(exc)
+            if getattr(exc.response, "status_code", None) == 403:
+                break  # every other book would be refused too
+    logger.info(
+        "[%s] Tag sync: %d confirmed from ABS tags, %d tagged in ABS, %d differ",
+        _user_label(g.user), len(confirmed), tagged, len(conflicts),
+    )
+    return jsonify({
+        "confirmed": len(confirmed),
+        "tagged": tagged,
+        "untagged": len(to_tag) - tagged,
+        "conflicts": conflicts,
+        "tag_error": tag_error,
+        "read_only": READ_ONLY,
+    })
 
 
 @app.route("/api/logs")

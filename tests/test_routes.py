@@ -121,10 +121,13 @@ class _ImportRouteCase(unittest.TestCase):
         self._real_client = A.StoryGraphClient
         self._real_resolve = A._resolve_abs_book
         self._real_sessions = A.get_abs_listening_sessions
+        self._real_tag = A.write_storygraph_tag
         FakeStoryGraph.reset()
         A.StoryGraphClient = FakeStoryGraph
         A._resolve_abs_book = lambda uid, iid: dict(self.book)
         A.get_abs_listening_sessions = lambda uid, iid: list(self.sessions)
+        self.tags_written = []
+        A.write_storygraph_tag = lambda uid, iid, book_id: self.tags_written.append((iid, book_id)) or True
 
         self.book = {
             "abs_item_id": self.ITEM, "title": "The Book", "author": "An Author",
@@ -146,6 +149,7 @@ class _ImportRouteCase(unittest.TestCase):
         A.StoryGraphClient = self._real_client
         A._resolve_abs_book = self._real_resolve
         A.get_abs_listening_sessions = self._real_sessions
+        A.write_storygraph_tag = self._real_tag
         A.READ_ONLY = False
         shutil.rmtree(self.data_dir, ignore_errors=True)
 
@@ -426,6 +430,27 @@ class EditionConfirmationTests(_ImportRouteCase):
         self.assertEqual(600.0, edition["duration_minutes"])
         self.assertEqual([], [c for f in FakeStoryGraph.instances for c in f.calls if c[0] == "book_page"])
 
+    def test_confirming_tags_the_abs_book_with_the_edition(self):
+        r = self.confirm(OTHER_ID).get_json()
+        self.assertEqual([(self.ITEM, OTHER_ID)], self.tags_written)
+        self.assertIsNone(r["tag_error"])
+
+    def test_a_failed_tag_still_confirms_and_says_why(self):
+        def refuse(uid, iid, book_id):
+            resp = A.req.Response()
+            resp.status_code = 403
+            raise A.req.HTTPError(response=resp)
+        A.write_storygraph_tag = refuse
+        r = self.confirm(OTHER_ID)
+        self.assertEqual(200, r.status_code)
+        self.assertIn("isn't allowed to update books", r.get_json()["tag_error"])
+        self.assertEqual("confirmed", self.stored_edition()["state"])
+
+    def test_read_only_mode_never_tags_abs(self):
+        A.READ_ONLY = True
+        self.assertEqual(200, self.confirm(OTHER_ID).status_code)
+        self.assertEqual([], self.tags_written)
+
     def test_rejects_something_that_is_not_a_book_id(self):
         self.assertEqual(400, self.confirm("the-book-i-meant").status_code)
 
@@ -516,6 +541,76 @@ class EditionsPageTests(_ImportRouteCase):
         self.assertEqual("confirmed", row["state"])
         self.assertEqual(OTHER_ID, row["edition"]["storygraph_book_id"])
         self.assertEqual([PRINT.book_id], [c["storygraph_book_id"] for c in row["candidates"]])
+
+    def test_a_lookup_suggests_the_edition_abs_is_tagged_with(self):
+        self.book["storygraph_tag"] = PRINT.book_id
+        row = self.lookup().get_json()
+        self.assertEqual((PRINT.book_id, "tagged"), (row["edition"]["storygraph_book_id"], row["reason"]["code"]))
+        self.assertEqual(PRINT.book_id, row["storygraph_tag"])
+        self.assertNotIn("tagged_unlisted", row["reason"])
+
+    def test_a_tagged_edition_the_search_missed_is_still_suggested_by_its_page_title(self):
+        self.book["storygraph_tag"] = OTHER_ID
+        row = self.lookup().get_json()
+        self.assertEqual("suggested", row["state"])
+        self.assertEqual((OTHER_ID, "Picked Edition"), (row["edition"]["storygraph_book_id"], row["edition"]["title"]))
+        self.assertTrue(row["reason"]["tagged_unlisted"])
+        self.assertIn(AUDIO.book_id, [c["storygraph_book_id"] for c in row["candidates"]])
+
+    def sync_tags(self, books):
+        A.get_abs_books = lambda user_id, scope, **kwargs: books
+        return self.client.post("/api/editions/sync-tags", json={}).get_json()
+
+    def test_tag_sync_confirms_tagged_books_and_tags_confirmed_ones(self):
+        self.lookup()  # suggests AUDIO, so its details are on file
+        tagged = dict(self.book, storygraph_tag=AUDIO.book_id)
+        bare = dict(self.book, abs_item_id="item-bare-tag", title="Bare", storygraph_tag=OTHER_ID)
+        untagged = dict(self.book, abs_item_id="item-untagged", title="Untagged")
+        A._editions(self.user["id"])["item-untagged"] = {
+            "state": "confirmed", "edition": {"storygraph_book_id": PRINT.book_id}, "candidates": [],
+        }
+        result = self.sync_tags([tagged, bare, untagged])
+        self.assertEqual((2, 1, 0, []), (result["confirmed"], result["tagged"], result["untagged"], result["conflicts"]))
+        self.assertEqual([("item-untagged", PRINT.book_id)], self.tags_written)
+        entry = self.stored_edition()
+        self.assertEqual(("confirmed", 600.0), (entry["state"], entry["edition"]["duration_minutes"]))
+        self.assertEqual(OTHER_ID, A._confirmed_edition_id(self.user["id"], "item-bare-tag"))
+        self.assertEqual([], FakeStoryGraph.instances[1:], "tag sync must not touch StoryGraph")
+
+    def test_tag_sync_leaves_a_different_confirmed_edition_alone_and_reports_it(self):
+        self.confirm(OTHER_ID)
+        self.tags_written.clear()
+        result = self.sync_tags([dict(self.book, storygraph_tag=AUDIO.book_id)])
+        self.assertEqual(["The Book"], result["conflicts"])
+        self.assertEqual(OTHER_ID, self.stored_edition()["edition"]["storygraph_book_id"])
+        self.assertEqual([], self.tags_written)
+
+    def test_tag_sync_stops_writing_once_abs_refuses(self):
+        attempts = []
+        def refuse(uid, iid, book_id):
+            attempts.append(iid)
+            resp = A.req.Response()
+            resp.status_code = 403
+            raise A.req.HTTPError(response=resp)
+        A.write_storygraph_tag = refuse
+        for item_id in ("item-one-aaaa", "item-two-aaaa"):
+            A._editions(self.user["id"])[item_id] = {
+                "state": "confirmed", "edition": {"storygraph_book_id": OTHER_ID}, "candidates": [],
+            }
+        books = [dict(self.book, abs_item_id=i) for i in ("item-one-aaaa", "item-two-aaaa")]
+        result = self.sync_tags(books)
+        self.assertEqual((0, 2), (result["tagged"], result["untagged"]))
+        self.assertIn("isn't allowed", result["tag_error"])
+        self.assertEqual(1, len(attempts))
+
+    def test_tag_sync_writes_no_tags_in_read_only_mode(self):
+        A._editions(self.user["id"])[self.ITEM] = {
+            "state": "confirmed", "edition": {"storygraph_book_id": OTHER_ID}, "candidates": [],
+        }
+        A.READ_ONLY = True
+        result = self.sync_tags([dict(self.book)])
+        self.assertEqual((0, 1, True), (result["tagged"], result["untagged"], result["read_only"]))
+        self.assertEqual([], self.tags_written)
 
     def test_a_lookup_records_why_it_did_or_did_not_match(self):
         self.assertEqual("identifier", self.lookup().get_json()["reason"]["code"])

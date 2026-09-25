@@ -139,6 +139,17 @@ whole ABS library, whatever your sync scope:
   editions qualify, the one you've already read on StoryGraph comes first, then
   the ABS narrator and publisher. Otherwise you can choose from the audio editions
   found, search again with your own words, or paste a StoryGraph book URL.
+- Confirming an edition also tags the book in Audiobookshelf with
+  `storygraph:<StoryGraph book id>`, replacing any older `storygraph:` tag. The
+  next lookup for that book, from any account or after losing this app's data,
+  suggests the tagged edition ahead of everything else. You can also add the tag
+  by hand in ABS. Writing it needs an ABS user allowed to update books; without
+  that permission the edition is still confirmed, just not tagged.
+- **Sync ABS tags** lines the two up across the whole library: books tagged in
+  ABS but not confirmed here are confirmed as the tagged edition, and confirmed
+  books without a tag get one. A book confirmed as a different edition from its
+  tag is left alone and flagged on its row, so you can pick which to keep. It
+  only talks to ABS, never StoryGraph.
 - A book without a confirmed edition is skipped by sync and reported as
   "needs edition". It syncs normally once you confirm one.
 

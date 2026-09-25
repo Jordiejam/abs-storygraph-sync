@@ -274,6 +274,31 @@ class MatcherTests(unittest.TestCase):
         self.assertEqual(("runtime_mismatch", 129.1),
                          (reason["read_edition"]["problem"], reason["read_edition"]["delta_minutes"]))
 
+    def test_the_edition_abs_is_tagged_with_wins_whatever_it_is(self):
+        exact = replace(audio("a", 970.0), identifier="B01")
+        tagged = EditionCandidate("c" * 36, "Book", "Hardcover", None, None, "Spanish", "Pub")
+        match, reason = match_audio_edition(
+            [exact, tagged], target_duration_minutes=970.9, identifiers=["B01"],
+            details=AudiobookDetails(language="English"), tagged_id=tagged.book_id,
+        )
+        self.assertIs(tagged, match)
+        self.assertEqual("tagged", reason["code"])
+
+    def test_a_tag_outranks_the_edition_you_have_read(self):
+        yours = replace(audio("a", 970.0), read_by_you=True)
+        tagged = audio("b", 972.0)
+        match, reason = match_audio_edition([yours, tagged], target_duration_minutes=970.9, tagged_id=tagged.book_id)
+        self.assertIs(tagged, match)
+        self.assertEqual("tagged_elsewhere", reason["read_edition"]["problem"])
+
+        match, reason = match_audio_edition([yours, tagged], target_duration_minutes=970.9, tagged_id=yours.book_id)
+        self.assertIs(yours, match)
+        self.assertTrue(reason["read_edition"]["chosen"])
+
+    def test_a_tag_for_an_edition_that_is_not_listed_changes_nothing(self):
+        match, reason = match_audio_edition([audio("a", 970.0)], target_duration_minutes=970.9, tagged_id="d" * 36)
+        self.assertEqual(("a" * 36, "runtime"), (match.book_id, reason["code"]))
+
     def test_a_matching_narrator_never_rescues_a_runtime_outside_tolerance(self):
         details = AudiobookDetails(narrators=("Ray Porter",))
         match, reason = match_audio_edition(

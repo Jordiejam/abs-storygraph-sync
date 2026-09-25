@@ -123,6 +123,9 @@ function matchReasonText(reason) {
   const off = Math.abs(reason.closest_delta_minutes);
   const direction = reason.closest_delta_minutes > 0 ? 'longer' : 'shorter';
   const lines = {
+    tagged: reason.tagged_unlisted
+      ? 'Audiobookshelf has this book tagged with this StoryGraph edition. It didn\'t come up in the search, so its format and runtime aren\'t shown.'
+      : 'Audiobookshelf has this book tagged with this StoryGraph edition, from when an edition was last confirmed.',
     identifier: `Matched on ${reason.identifier}, the same ISBN/ASIN Audiobookshelf has.`,
     runtime: off
       ? `Runtime is ${off} min ${direction} than Audiobookshelf's (up to ${reason.tolerance_minutes} min counts as a match).`
@@ -155,7 +158,7 @@ function matchReasonText(reason) {
   } else if (reason.code === 'runtime' && reason.others_within_tolerance) {
     text += ` ${plural(reason.others_within_tolerance, 'other audio edition')} ${reason.others_within_tolerance === 1 ? 'is' : 'are'} also that close (often a different region's release), so check it's the one you use.`;
   }
-  if (reason.code !== 'identifier' && reason.audio_editions && !['no_results', 'no_audio'].includes(reason.code)) {
+  if (reason.audio_editions && !['identifier', 'tagged', 'no_results', 'no_audio'].includes(reason.code)) {
     text += reason.abs_has_identifier
       ? ' None of them carry the ISBN/ASIN Audiobookshelf has.'
       : ' Audiobookshelf has no ISBN/ASIN for this book to match on.';
@@ -184,6 +187,7 @@ function readEditionNote(reason, pickJs) {
     not_audio: `It's the ${read.format} edition, not an audiobook.`,
     other_language: `It's in ${read.language}.`,
     identifier_elsewhere: 'The suggestion carries the ISBN/ASIN Audiobookshelf has.',
+    tagged_elsewhere: 'Audiobookshelf has this book tagged with the suggestion instead.',
     no_runtime: 'StoryGraph doesn\'t list its runtime, so it can\'t be checked against Audiobookshelf\'s.',
     runtime_mismatch: `Its runtime is ${off} min ${read.delta_minutes > 0 ? 'longer' : 'shorter'} than Audiobookshelf's.`,
     outranked: read.narrator_check === false

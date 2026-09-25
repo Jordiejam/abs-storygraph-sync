@@ -202,7 +202,9 @@ function editionSection(itemId, data) {
     return `<div class="history-note">${editionBadge('confirmed')} Edition: <strong>${editionTitleLink(edition)}</strong> ${editionDetails(edition, data.book)}</div>`;
   }
   const lead = data.edition_state === 'suggested'
-    ? `<div class="history-note">${editionBadge('suggested')} Suggested edition: <strong>${editionTitleLink(edition, edition.read_by_you ? READ_EDITION_FALLBACK : 'the edition earlier syncs used')}</strong> ${editionDetails(edition, data.book)}
+    ? `<div class="history-note">${editionBadge('suggested')} Suggested edition: <strong>${editionTitleLink(edition, data.match_reason?.code === 'tagged'
+      ? 'the edition tagged in Audiobookshelf'
+      : edition.read_by_you ? READ_EDITION_FALLBACK : 'the edition earlier syncs used')}</strong> ${editionDetails(edition, data.book)}
          <button class="btn btn-primary" style="margin-left:0.5rem" onclick="${pick(edition.storygraph_book_id)}">Confirm</button>
          ${matchReasonText(data.match_reason)}${readEditionNote(data.match_reason, pick)}</div>
        <div class="history-note">Nothing can be imported until you confirm which StoryGraph edition this is.</div>`
@@ -333,7 +335,8 @@ async function postEditionChoice(itemId, storygraphBookId) {
   const content = document.getElementById('history-content');
   content.innerHTML = '<div class="empty-state">Confirming that edition…</div>';
   try {
-    await confirmEdition(itemId, storygraphBookId);
+    const d = await confirmEdition(itemId, storygraphBookId);
+    if (d.tag_error) toast(`Edition confirmed. ${d.tag_error}.`, 'err');
     openHistory(itemId);
     fetchStatus();
   } catch (e) {

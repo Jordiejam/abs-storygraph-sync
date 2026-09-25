@@ -32,7 +32,7 @@ async function loadEditions() {
     if (query) {
       document.getElementById('edition-search').value = query;
       filter = 'all';
-    } else {
+    } else if (!filter) {
       filter = books.some(FILTERS.review.match) ? 'review' : 'unchecked';
     }
     renderEditions();
@@ -79,7 +79,9 @@ function listeningTag(b) {
 }
 
 function editionSummary(b) {
-  if (b.state === 'unchecked') return '';
+  if (b.state === 'unchecked') {
+    return b.storygraph_tag ? '<span class="text-dim">Tagged with a StoryGraph edition in Audiobookshelf — sync ABS tags to confirm it</span>' : '';
+  }
   if (b.state === 'unmatched') {
     const n = b.candidates.length;
     return `<span class="text-dim">${n
@@ -90,11 +92,23 @@ function editionSummary(b) {
   const warning = b.synced_book_id && b.synced_book_id !== e.storygraph_book_id
     ? `<div class="edition-warning">Sync has written progress to <a href="${storygraphUrl(b.synced_book_id)}" target="_blank" rel="noopener">a different edition ↗</a>. That progress stays there; only new progress goes to this one.</div>`
     : '';
+  const tagDiffers = b.state === 'confirmed' && b.storygraph_tag && b.storygraph_tag !== e.storygraph_book_id
+    ? `<div class="read-note">
+        <div>Audiobookshelf has this book tagged with ${editionTitleLink({ storygraph_book_id: b.storygraph_tag }, 'a different edition')}.
+          Using it confirms that edition here instead; keeping this one re-tags the book.</div>
+        <div class="book-actions">
+          <button class="btn btn-ghost" onclick="pickEdition(${jsArg(b.abs_item_id)}, ${jsArg(b.storygraph_tag)})">Use the tagged edition</button>
+          <button class="btn btn-ghost" onclick="pickEdition(${jsArg(b.abs_item_id)}, ${jsArg(e.storygraph_book_id)})">Keep this one</button>
+        </div>
+      </div>`
+    : '';
   return `
-    <div class="edition-title">${editionTitleLink(e, e.read_by_you ? READ_EDITION_FALLBACK : 'The edition earlier syncs used')}</div>
+    <div class="edition-title">${editionTitleLink(e, e.storygraph_book_id === b.storygraph_tag
+      ? 'The edition tagged in Audiobookshelf'
+      : e.read_by_you ? READ_EDITION_FALLBACK : 'The edition earlier syncs used')}</div>
     <div class="text-dim">${editionDetails(e, b) || 'No format or runtime on file'}</div>
     ${b.state === 'suggested' ? matchReasonText(b.reason) + readEditionNote(b.reason, pickFor(b)) : ''}
-    ${warning}`;
+    ${warning}${tagDiffers}`;
 }
 
 function pickFor(b) {
@@ -237,14 +251,41 @@ async function pickEdition(itemId, storygraphBookId) {
   updateRow(itemId);
   try {
     const d = await confirmEdition(itemId, storygraphBookId);
-    replaceBook(itemId, { state: d.state, edition: d.edition });
+    replaceBook(itemId, {
+      state: d.state,
+      edition: d.edition,
+      ...(d.tag_error ? {} : { storygraph_tag: d.edition.storygraph_book_id }),
+    });
     expanded.delete(itemId);
-    toast('✓ Edition confirmed');
+    toast(d.tag_error ? `✓ Edition confirmed. ${d.tag_error}.` : '✓ Edition confirmed', d.tag_error ? 'err' : 'ok');
   } catch (e) {
     toast(e.message || 'Could not use that edition', 'err');
   } finally {
     busy.delete(itemId);
     updateRow(itemId);
+  }
+}
+
+async function syncTags() {
+  const btn = document.getElementById('tag-sync-btn');
+  btn.disabled = true;
+  btn.textContent = 'Syncing tags…';
+  try {
+    const d = await sendJSON('/api/editions/sync-tags', {});
+    const parts = [
+      d.confirmed && `${plural(d.confirmed, 'book')} confirmed from tags`,
+      d.tagged && `${plural(d.tagged, 'book')} tagged in Audiobookshelf`,
+      d.conflicts.length && `${plural(d.conflicts.length, 'book')} tagged with a different edition — see Confirmed`,
+      d.untagged && (d.read_only ? `${d.untagged} not tagged in read-only mode` : d.tag_error),
+    ].filter(Boolean);
+    toast(parts.length ? parts.join(' · ') : '✓ Tags and confirmed editions already match',
+      d.conflicts.length || d.untagged ? 'err' : 'ok');
+    await loadEditions();
+  } catch (e) {
+    toast(e.message || 'Could not sync tags', 'err');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Sync ABS tags';
   }
 }
 

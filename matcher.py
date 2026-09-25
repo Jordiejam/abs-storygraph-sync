@@ -307,6 +307,7 @@ def match_audio_edition(
     target_duration_minutes: float | None,
     identifiers: list[str] | None = None,
     details: AudiobookDetails | None = None,
+    tagged_id: str | None = None,
 ) -> tuple[EditionCandidate | None, dict]:
     """Choose a confident audiobook edition, and say why it was or wasn't.
     When you've already read one edition, the reason also says whether that
@@ -316,6 +317,7 @@ def match_audio_edition(
         target_duration_minutes=target_duration_minutes,
         identifiers=identifiers,
         details=details,
+        tagged_id=tagged_id,
     )
     read = next((candidate for candidate in candidates if candidate.read_by_you), None)
     if read:
@@ -325,13 +327,15 @@ def match_audio_edition(
             "format": read.format or None,
             "language": read.language,
             "chosen": best is read,
-            **({} if best is read else _why_not_chosen(read, best, target_duration_minutes, identifiers, details)),
+            **({} if best is read else _why_not_chosen(read, best, target_duration_minutes, identifiers, details, tagged_id)),
         }
     return best, reason
 
 
-def _why_not_chosen(read, best, target_duration_minutes, identifiers, details) -> dict:
+def _why_not_chosen(read, best, target_duration_minutes, identifiers, details, tagged_id=None) -> dict:
     """Why the edition you've read isn't the match, as {"problem": code, ...}."""
+    if best and best.book_id == tagged_id:
+        return {"problem": "tagged_elsewhere"}
     if not read.format:
         return {"problem": "not_listed"}
     if not read.is_audio:
@@ -360,11 +364,16 @@ def _match_audio(
     target_duration_minutes: float | None,
     identifiers: list[str] | None = None,
     details: AudiobookDetails | None = None,
+    tagged_id: str | None = None,
 ) -> tuple[EditionCandidate | None, dict]:
     """Choose a confident audiobook edition, and say why it was or wasn't.
 
-    An audio edition in a different language from the ABS book is never
-    chosen. Then an exact ISBN/UID/ASIN match wins. Otherwise an edition's
+    The edition the ABS book is tagged with (``tagged_id``) wins outright,
+    whatever its format or language: the tag is written when a person confirms
+    an edition, so it's their pick rather than a guess.
+
+    Otherwise an audio edition in a different language from the ABS book is
+    never chosen. Then an exact ISBN/UID/ASIN match wins. Otherwise an edition's
     runtime must be within 2% of the ABS runtime, with a floor of three minutes
     and a ceiling of fifteen. Refusing an uncertain match is deliberate: no
     StoryGraph update is safer than writing progress to the wrong edition.
@@ -385,6 +394,9 @@ def _match_audio(
         "other_language_editions": len(all_audio) - len(audio),
         "abs_has_identifier": bool(wanted_ids),
     }
+    tagged = next((candidate for candidate in candidates if candidate.book_id == tagged_id), None) if tagged_id else None
+    if tagged:
+        return tagged, {**reason, "code": "tagged"}
     if not candidates:
         return None, {**reason, "code": "no_results"}
     if not all_audio:

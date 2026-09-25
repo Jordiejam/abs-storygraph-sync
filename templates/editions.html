@@ -16,12 +16,17 @@
   <div class="card">
     <div class="section-header">
       <h2>Editions</h2>
-      <button class="btn btn-primary" id="lookup-btn" onclick="lookUpSelected()" disabled>Search selected</button>
+      <div class="book-actions">
+        <button class="btn btn-ghost" id="tag-sync-btn" onclick="syncTags()"
+          title="Confirm books tagged with a StoryGraph edition in Audiobookshelf, and tag confirmed books that aren't">Sync ABS tags</button>
+        <button class="btn btn-primary" id="lookup-btn" onclick="lookUpSelected()" disabled>Search selected</button>
+      </div>
     </div>
     <p class="text-dim editions-intro">
       Sync and History Import only write to an edition you've confirmed here.
       Tick books and search StoryGraph for them, then check each suggestion and confirm it.
-      Nothing is searched or confirmed without you asking.
+      Nothing is searched or confirmed without you asking. <strong>Sync ABS tags</strong> confirms books
+      already tagged <code>storygraph:&lt;id&gt;</code> in Audiobookshelf and tags the confirmed ones that aren't.
     </p>
     <div class="editions-toolbar">
       <div class="filter-group" id="filter-group"></div>
