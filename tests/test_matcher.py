@@ -2,7 +2,7 @@ import unittest
 from dataclasses import replace
 
 from matcher import (
-    AudiobookDetails, EditionCandidate, choose_audio_edition, edition_checks, match_audio_edition,
+    AudiobookDetails, EditionCandidate, edition_checks, match_audio_edition,
     merge_editions, parse_filtered_editions, parse_storygraph_editions,
 )
 
@@ -59,7 +59,7 @@ class MatcherTests(unittest.TestCase):
     def test_selects_audio_edition_by_runtime(self):
         editions = parse_storygraph_editions(EDITIONS_HTML)
 
-        match = choose_audio_edition(editions, target_duration_minutes=893.5)
+        match, _ = match_audio_edition(editions, target_duration_minutes=893.5)
 
         self.assertIsNotNone(match)
         self.assertEqual("36c06d90-2a99-4042-99ea-27435701f9dc", match.book_id)
@@ -67,14 +67,14 @@ class MatcherTests(unittest.TestCase):
     def test_refuses_a_large_runtime_mismatch(self):
         editions = parse_storygraph_editions(EDITIONS_HTML)
 
-        match = choose_audio_edition(editions, target_duration_minutes=600)
+        match, _ = match_audio_edition(editions, target_duration_minutes=600)
 
         self.assertIsNone(match)
 
     def test_exact_identifier_takes_priority(self):
         editions = parse_storygraph_editions(EDITIONS_HTML)
 
-        match = choose_audio_edition(
+        match, _ = match_audio_edition(
             editions,
             target_duration_minutes=600,
             identifiers=["b08x-18tdfq"],

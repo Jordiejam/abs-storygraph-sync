@@ -15,6 +15,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 import app as A
 from matcher import EditionCandidate
@@ -534,6 +535,14 @@ class EditionConfirmationTests(_ImportRouteCase):
         self.assertEqual(200, self.confirm(OTHER_ID).status_code)
         self.assertEqual([], self.tags_written)
 
+    def test_a_signed_out_session_never_confirms_a_pasted_edition(self):
+        def signed_out(self, book_id):
+            raise A.StoryGraphAuthError("StoryGraph session invalid — update it in Settings")
+        with mock.patch.object(FakeStoryGraph, "get_book_page", signed_out):
+            r = self.confirm(OTHER_ID)
+        self.assertEqual(401, r.status_code)
+        self.assertNotIn(self.ITEM, A._editions(self.user["id"]))
+
     def test_rejects_something_that_is_not_a_book_id(self):
         self.assertEqual(400, self.confirm("the-book-i-meant").status_code)
 
@@ -773,7 +782,11 @@ class EditionMigrationTests(_ImportRouteCase):
             "An Old Title": {"pct": 5.0, "status": "currently-reading", "storygraph_book_id": AUDIO.book_id},
         })
 
+        A._edition_store.get(user_id).clear()
+        A._migrate_legacy_state(user_id)
+        A._migrate_legacy_state(user_id)  # idempotent
         editions = A._editions(user_id)
+        self.assertNotIn("An Old Title", A._sync_store.get(user_id))
         self.assertEqual({
             "item-manual1": "confirmed", "item-auto0001": "suggested", "item-synced01": "suggested",
         }, {item_id: entry["state"] for item_id, entry in editions.items()})

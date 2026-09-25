@@ -9,8 +9,10 @@ import re
 
 from bs4 import BeautifulSoup
 
+from matcher import STORYGRAPH_ID_PATTERN
 
-_ENTRY_PATH_RE = re.compile(r"/journal_entries/([0-9a-fA-F-]{36})/edit")
+
+_ENTRY_PATH_RE = re.compile(rf"/journal_entries/({STORYGRAPH_ID_PATTERN})/edit")
 _ENTRY_DATE_RE = re.compile(
     r"\b(\d{1,2}) (January|February|March|April|May|June|July|August|September|October|November|December) (\d{4})\b"
 )
@@ -32,18 +34,24 @@ def _entry_ids(tag) -> list[str]:
     ))
 
 
-def journal_entry_ids(html: str) -> list[str]:
+def soup(page: str | BeautifulSoup) -> BeautifulSoup:
+    """A journal page, parsed once. Every function here takes either the HTML
+    or this, so a caller reading one page several ways parses it only once."""
+    return page if isinstance(page, BeautifulSoup) else BeautifulSoup(page, "html.parser")
+
+
+def journal_entry_ids(page: str | BeautifulSoup) -> list[str]:
     """Every entry on a journal page, dated or not."""
-    return _entry_ids(BeautifulSoup(html, "html.parser"))
+    return _entry_ids(soup(page))
 
 
-def started_entry_ids(html: str) -> list[str]:
+def started_entry_ids(page: str | BeautifulSoup) -> list[str]:
     """The "Started reading" entries on a journal page, dated or not: one per
     read, begun when the book was set to currently reading."""
-    soup = BeautifulSoup(html, "html.parser")
+    parsed = soup(page)
     started = []
-    for entry_id in _entry_ids(soup):
-        link = soup.find("a", href=re.compile(re.escape(f"/journal_entries/{entry_id}/edit")))
+    for entry_id in _entry_ids(parsed):
+        link = parsed.find("a", href=re.compile(re.escape(f"/journal_entries/{entry_id}/edit")))
         # The whole entry is the largest ancestor that holds no other entry.
         block = link
         while block.parent is not None and len(_entry_ids(block.parent)) == 1:
@@ -104,17 +112,16 @@ def _entry_percent(container) -> float | None:
     return None
 
 
-def parse_journal_page(html: str) -> list[JournalEntry]:
+def parse_journal_page(page: str | BeautifulSoup) -> list[JournalEntry]:
     """Parse logged entries from a StoryGraph ``/journal?book_id=<id>`` page.
 
     Relies on the visible date text and percent readout rather than layout
     classes, since the site's markup changes fairly often (same philosophy as
     matcher.py's edition parsing).
     """
-    soup = BeautifulSoup(html, "html.parser")
     by_id: dict[str, JournalEntry] = {}
 
-    for link in soup.find_all("a", href=True):
+    for link in soup(page).find_all("a", href=True):
         match = _ENTRY_PATH_RE.search(link.get("href", ""))
         if not match:
             continue

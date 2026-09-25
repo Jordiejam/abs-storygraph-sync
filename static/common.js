@@ -103,6 +103,31 @@ function editionTitleLink(edition, fallback = 'Untitled edition') {
   return `<a href="${storygraphUrl(edition.storygraph_book_id)}" target="_blank" rel="noopener">${esc(edition.title || fallback)} ↗</a>`;
 }
 
+// What to call an edition StoryGraph gave no title for, on this ABS book.
+function editionFallbackTitle(edition, book) {
+  if (edition.storygraph_book_id === book?.storygraph_tag) return 'The edition tagged in Audiobookshelf';
+  return edition.read_by_you ? READ_EDITION_FALLBACK : 'The edition earlier syncs used';
+}
+
+// The candidates worth listing beside `edition`: every one but itself.
+function otherCandidates(candidates, edition) {
+  return (candidates || []).filter(c => c.storygraph_book_id !== edition?.storygraph_book_id);
+}
+
+// A field for pasting any StoryGraph book URL or id. Its button calls the
+// global function `pickFn(itemId, pasted)`.
+function pasteEditionField(pickFn, itemId, inputId, label, hint = '') {
+  return `
+    <div class="field" style="margin-top:0.75rem">
+      <label for="${esc(inputId)}">${esc(label)}</label>
+      <div class="picker-row">
+        <input type="text" id="${esc(inputId)}" placeholder="https://app.thestorygraph.com/books/...">
+        <button class="btn btn-ghost" onclick="${pickFn}(${jsArg(itemId)}, document.getElementById(${jsArg(inputId)}).value.trim())">Use this</button>
+      </div>
+      ${hint ? `<span class="hint">${esc(hint)}</span>` : ''}
+    </div>`;
+}
+
 // `pickJs` is the onclick body for this candidate, given its book id.
 function candidateRows(candidates, book, pickJs) {
   return candidates.map(c => `
@@ -115,8 +140,8 @@ function candidateRows(candidates, book, pickJs) {
     </div>`).join('');
 }
 
-function plural(n, word) {
-  return `${n} ${word}${n === 1 ? '' : 's'}`;
+function plural(n, word, pluralWord = `${word}s`) {
+  return `${n} ${n === 1 ? word : pluralWord}`;
 }
 
 // Why the last lookup did or didn't find a confident match, as a sentence or
@@ -206,8 +231,12 @@ function readEditionNote(reason, pickJs) {
     </div>`;
 }
 
-function confirmEdition(itemId, storygraphBookId) {
-  return sendJSON(`/api/editions/${encodeURIComponent(itemId)}/confirm`, { storygraph_book_id: storygraphBookId });
+// Confirms and says so. The edition stands even when tagging it in
+// Audiobookshelf failed, so that's only a warning.
+async function confirmEdition(itemId, storygraphBookId) {
+  const d = await sendJSON(`/api/editions/${encodeURIComponent(itemId)}/confirm`, { storygraph_book_id: storygraphBookId });
+  toast(d.tag_error ? `✓ Edition confirmed. ${d.tag_error}.` : '✓ Edition confirmed', d.tag_error ? 'err' : 'ok');
+  return d;
 }
 
 // ── Toast ────────────────────────────────────────────────────────────────

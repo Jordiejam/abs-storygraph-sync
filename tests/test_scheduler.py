@@ -53,6 +53,10 @@ class SchedulerTests(unittest.TestCase):
             "TIMEZONE": "Europe/London",
         })
         self.user = {"id": self.USER_ID, "username": "jordan"}
+        # Auto-sync only ever looks at books with a confirmed edition.
+        A._edition_store.get(self.USER_ID)["books"] = {
+            "item-1": {"state": "confirmed", "edition": {"storygraph_book_id": "sg-A Book"}},
+        }
 
         self.real_progress = A.get_abs_progress
         self.real_books = A.get_abs_books
@@ -136,6 +140,7 @@ class SchedulerTests(unittest.TestCase):
         A.get_abs_progress = lambda user_id: snapshot
         A.get_abs_books = lambda *args, **kwargs: []
         A.get_abs_book = lambda user_id, item_id, item_progress: book(finished=True)
+        A._finish_daily_history = lambda *args: True
         starts = []
 
         def fake_sync(user_id, books, start_before_finish=None, **kwargs):
@@ -389,14 +394,17 @@ class SchedulerTests(unittest.TestCase):
         self.assertTrue(A._daily_history_sync(*args))
         self.assertEqual([("sg-confirmed", "2026-09-21")], sg["writes"])
 
+    def candidates(self, scope="in_progress_finished", **item_progress):
+        return A._frequent_sync_candidates(self.USER_ID, {"item-1": progress(**item_progress)}, scope)
+
     def test_frequent_threshold_uses_durable_sync_position(self):
         A._sync_store.get(self.USER_ID)["item-1"] = {
             "pct": 10.0,
             "current_minutes": 10.0,
             "status": "currently-reading",
         }
-        self.assertEqual([], A._frequent_sync_candidates(self.USER_ID, [book(current=14.9)]))
-        self.assertEqual(1, len(A._frequent_sync_candidates(self.USER_ID, [book(current=15.0)])))
+        self.assertEqual([], self.candidates(current=14.9 * 60))
+        self.assertEqual(["item-1"], self.candidates(current=15 * 60))
 
     def test_frequent_mode_does_not_recheck_an_already_synced_finish(self):
         A._sync_store.get(self.USER_ID)["item-1"] = {
@@ -404,7 +412,66 @@ class SchedulerTests(unittest.TestCase):
             "current_minutes": 100.0,
             "status": "read",
         }
-        self.assertEqual([], A._frequent_sync_candidates(self.USER_ID, [book(current=100.0, finished=True)]))
+        self.assertEqual([], self.candidates(current=6000, finished=True))
+        del A._sync_store.get(self.USER_ID)["item-1"]
+        self.assertEqual(["item-1"], self.candidates(current=6000, finished=True))
+
+    def test_frequent_candidates_skip_books_without_a_confirmed_edition(self):
+        A._edition_store.get(self.USER_ID)["books"] = {}
+        self.assertEqual([], self.candidates(current=6000))
+
+    def test_the_in_progress_scope_leaves_out_what_abs_does(self):
+        self.assertEqual([], self.candidates("in_progress", current=6000, finished=True))
+        self.assertEqual(["item-1"], self.candidates("in_progress", current=6000))
+
+    def test_a_quiet_frequent_poll_fetches_no_books_and_never_reaches_storygraph(self):
+        A.set_cfg(self.USER_ID, {"SYNC_MODE": "frequent"})
+        self.initialized_state(books={"item-1": {"handled_started_at": 100, "handled_finished_at": None}})
+        A._sync_store.get(self.USER_ID)["item-1"] = {
+            "pct": 10.0, "current_minutes": 10.0, "status": "currently-reading", "storygraph_book_id": "sg-A Book",
+        }
+        A.get_abs_progress = lambda user_id: {"item-1": progress(current=600)}
+        A.get_abs_books = lambda *args, **kwargs: self.fail("fetched the whole scope")
+        A.get_abs_book = lambda *args: self.fail("fetched a book that hadn't moved")
+        A.do_sync = lambda *args, **kwargs: self.fail("synced with nothing to write")
+        A._poll_user(self.user)
+
+    def test_a_frequent_poll_fetches_only_the_book_that_moved(self):
+        A.set_cfg(self.USER_ID, {"SYNC_MODE": "frequent"})
+        self.initialized_state(books={
+            "item-1": {"handled_started_at": 100, "handled_finished_at": None},
+            "item-2": {"handled_started_at": 100, "handled_finished_at": None},
+        })
+        A._edition_store.get(self.USER_ID)["books"]["item-2"] = {
+            "state": "confirmed", "edition": {"storygraph_book_id": "sg-Other"},
+        }
+        A._sync_store.get(self.USER_ID).update({
+            "item-1": {"pct": 10.0, "current_minutes": 10.0, "status": "currently-reading"},
+            "item-2": {"pct": 10.0, "current_minutes": 10.0, "status": "currently-reading"},
+        })
+        A.get_abs_progress = lambda user_id: {
+            "item-1": progress(current=1200),
+            "item-2": {**progress(current=600), "libraryItemId": "item-2"},
+        }
+        A.get_abs_books = lambda *args, **kwargs: self.fail("fetched the whole scope")
+        fetched = []
+        A.get_abs_book = lambda user_id, item_id, item_progress: fetched.append(item_id) or book(current=20.0)
+        A.do_sync = lambda user_id, books, **kwargs: [{"status": "success", "title": b["title"]} for b in books]
+        A._poll_user(self.user)
+        self.assertEqual(["item-1"], fetched)
+
+    def test_an_unchanged_book_remembers_its_position(self):
+        A._sync_store.get(self.USER_ID)["item-1"] = {
+            "pct": 10.0, "current_minutes": 10.0, "status": "currently-reading", "storygraph_book_id": "sg-A Book",
+        }
+
+        class NoStoryGraph:
+            def check_auth(self):
+                raise AssertionError("checked the session with nothing to write")
+
+        results = A.do_sync(self.USER_ID, [book(current=16.0)], label="jordan", client=NoStoryGraph())
+        self.assertEqual("unchanged", results[0]["status"])
+        self.assertEqual(16.0, A._sync_store.get(self.USER_ID)["item-1"]["current_minutes"])
 
 
 if __name__ == "__main__":

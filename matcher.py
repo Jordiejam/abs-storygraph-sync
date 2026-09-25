@@ -10,7 +10,9 @@ import json
 from bs4 import BeautifulSoup
 
 
-_BOOK_PATH_RE = re.compile(r"^/books/([0-9a-fA-F-]{36})/?$")
+# A StoryGraph book or journal-entry id.
+STORYGRAPH_ID_PATTERN = r"[0-9a-fA-F-]{36}"
+_BOOK_PATH_RE = re.compile(rf"^/books/({STORYGRAPH_ID_PATTERN})/?$")
 # A card's runtime sits at the start of its "16h 10m • audio • 2021" line, and
 # a whole number of hours is written "13h" with no minutes. Requiring the
 # bullet keeps stray text (a series number, a tag) from reading as a runtime.
@@ -33,6 +35,11 @@ class EditionCandidate:
     @property
     def is_audio(self) -> bool:
         return "audio" in self.format.casefold()
+
+
+def bare_edition(book_id: str, title: str = "") -> EditionCandidate:
+    """An edition known by its id alone, with no card to describe it."""
+    return EditionCandidate(book_id, title, "", None, None, None, None)
 
 
 @dataclass(frozen=True)
@@ -107,7 +114,7 @@ def parse_storygraph_editions(html: str) -> list[EditionCandidate]:
     single layout class; the site changes its presentation markup fairly often.
     """
     soup = BeautifulSoup(html, "html.parser")
-    by_id: dict[str, EditionCandidate] = {}
+    candidates: list[EditionCandidate] = []
     read_ids: list[str] = []
 
     for link in soup.find_all("a", href=True):
@@ -126,7 +133,7 @@ def parse_storygraph_editions(html: str) -> list[EditionCandidate]:
 
         lines = [line.strip() for line in container.get_text("\n", strip=True).splitlines() if line.strip()]
         edition_format = _field_value(lines, "Format") or ""
-        candidate = EditionCandidate(
+        candidates.append(EditionCandidate(
             book_id=match.group(1),
             title=link.get_text(" ", strip=True),
             format=edition_format,
@@ -135,20 +142,14 @@ def parse_storygraph_editions(html: str) -> list[EditionCandidate]:
             language=_field_value(lines, "Language"),
             publisher=_field_value(lines, "Publisher"),
             narrators=_narrators(container, lines, "audio" in edition_format.casefold()),
-        )
-        previous = by_id.get(candidate.book_id)
-        if previous is None or _candidate_completeness(candidate) > _candidate_completeness(previous):
-            by_id[candidate.book_id] = candidate
+        ))
 
     if read_ids:
-        read_id = read_ids[0]
         # The edition you've read can be on a later page of the list. It's
-        # still worth offering, so it's kept as a bare id with no details.
-        by_id[read_id] = replace(
-            by_id.get(read_id) or EditionCandidate(read_id, "", "", None, None, None, None),
-            read_by_you=True,
-        )
-    return list(by_id.values())
+        # still worth offering, so it's kept as a bare id with no details;
+        # merging marks its full card as yours if the page has one.
+        candidates.append(replace(bare_edition(read_ids[0]), read_by_you=True))
+    return merge_editions(candidates)
 
 
 # A jQuery call's quoted argument inside the filter response: a JS string
@@ -211,6 +212,16 @@ def _candidate_completeness(candidate: EditionCandidate) -> int:
 
 def _normalise_identifier(value: str | None) -> str:
     return re.sub(r"[^A-Z0-9]", "", (value or "").upper())
+
+
+def _wanted_identifiers(identifiers: list[str] | None) -> set[str]:
+    return {_normalise_identifier(value) for value in identifiers or [] if value}
+
+
+def _runtime_tolerance(target_duration_minutes: float) -> float:
+    """How far an edition's runtime may be from ABS's and still match: 2%,
+    at least three minutes and at most fifteen."""
+    return max(3.0, min(15.0, target_duration_minutes * 0.02))
 
 
 def _normalise_name(value: str | None) -> str:
@@ -286,21 +297,6 @@ def _metadata_score(candidate: EditionCandidate, details: AudiobookDetails | Non
     )
 
 
-def choose_audio_edition(
-    candidates: list[EditionCandidate],
-    *,
-    target_duration_minutes: float | None,
-    identifiers: list[str] | None = None,
-) -> EditionCandidate | None:
-    """Choose a confident audiobook edition or return ``None``. See
-    match_audio_edition for the rules and the reason behind the outcome."""
-    return match_audio_edition(
-        candidates,
-        target_duration_minutes=target_duration_minutes,
-        identifiers=identifiers,
-    )[0]
-
-
 def match_audio_edition(
     candidates: list[EditionCandidate],
     *,
@@ -342,15 +338,14 @@ def _why_not_chosen(read, best, target_duration_minutes, identifiers, details, t
         return {"problem": "not_audio"}
     if edition_checks(read, details)["language"] is False:
         return {"problem": "other_language"}
-    wanted_ids = {_normalise_identifier(value) for value in identifiers or [] if value}
+    wanted_ids = _wanted_identifiers(identifiers)
     if best and wanted_ids and _normalise_identifier(best.identifier) in wanted_ids:
         return {"problem": "identifier_elsewhere"}
     if target_duration_minutes and read.duration_minutes is None:
         return {"problem": "no_runtime"}
     if target_duration_minutes and read.duration_minutes is not None:
         delta = round(read.duration_minutes - target_duration_minutes, 1)
-        tolerance = max(3.0, min(15.0, target_duration_minutes * 0.02))
-        if abs(delta) > tolerance:
+        if abs(delta) > _runtime_tolerance(target_duration_minutes):
             return {"problem": "runtime_mismatch", "delta_minutes": delta}
     if best is None:
         return {"problem": "unclear"}
@@ -387,7 +382,7 @@ def _match_audio(
     """
     all_audio = [candidate for candidate in candidates if candidate.is_audio]
     audio = [candidate for candidate in all_audio if edition_checks(candidate, details)["language"] is not False]
-    wanted_ids = {_normalise_identifier(value) for value in identifiers or [] if value}
+    wanted_ids = _wanted_identifiers(identifiers)
     reason = {
         "editions": len(candidates),
         "audio_editions": len(audio),
@@ -439,7 +434,7 @@ def _match_audio(
     def delta(candidate):
         return abs(candidate.duration_minutes - target_duration_minutes)
 
-    tolerance = max(3.0, min(15.0, target_duration_minutes * 0.02))
+    tolerance = _runtime_tolerance(target_duration_minutes)
     closest = min(with_duration, key=delta)
     reason["tolerance_minutes"] = round(tolerance, 1)
     within = [candidate for candidate in with_duration if delta(candidate) <= tolerance]

@@ -122,6 +122,12 @@ class HelperTests(unittest.TestCase):
             [("http://abs/api/items/item-1/media", {"tags": ["Fantasy", f"storygraph:{new_id}"]})], patches,
         )
 
+    def test_the_log_buffer_numbers_lines_past_its_length(self):
+        buffer = A.LogBuffer(maxlen=2)
+        for n in range(3):
+            buffer.emit(A.logging.LogRecord("t", A.logging.INFO, "", 0, f"line {n}", None, None))
+        self.assertEqual([(2, "line 1"), (3, "line 2")], [(r["seq"], r["msg"]) for r in buffer.get()])
+
     def test_a_missing_abs_item_is_none_rather_than_an_error(self):
         with mock.patch.object(A.req, "get", lambda url, **kwargs: _FakeResponse({}, 404)):
             self.assertIsNone(A.get_abs_book(self.USER_ID, "gone", {}))
@@ -301,6 +307,20 @@ class StoryGraphPageTests(unittest.TestCase):
 
         with self.assertRaises(A.StoryGraphAuthError):
             self.client.ensure_status("b1", "read", html=_book_page("to read"))
+
+    def test_a_signed_out_book_page_raises_rather_than_reading_as_off_the_shelf(self):
+        self.client._get = lambda path: _Resp("<title>Sign in</title>", url="https://app.thestorygraph.com/users/sign_in")
+
+        with self.assertRaises(A.StoryGraphAuthError):
+            self.client.get_book_page("b1")
+
+    def test_a_failed_session_check_is_remembered(self):
+        checks = []
+        self.client._get = lambda path: checks.append(path) or _Resp("", url="https://app.thestorygraph.com/users/sign_in")
+
+        self.assertFalse(self.client.check_auth())
+        self.assertFalse(self.client.check_auth())
+        self.assertEqual(["/"], checks)
 
     def test_cleared_progress_reads_as_unknown(self):
         self.assertIsNone(A._parse_current_progress(_book_page("currently reading")))

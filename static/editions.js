@@ -85,7 +85,7 @@ function editionSummary(b) {
   if (b.state === 'unmatched') {
     const n = b.candidates.length;
     return `<span class="text-dim">${n
-      ? `No confident match · ${n} candidate${n === 1 ? '' : 's'} to choose from`
+      ? `No confident match · ${plural(n, 'candidate')} to choose from`
       : 'Nothing found on StoryGraph — try different search words'}</span>${matchReasonText(b.reason)}${readEditionNote(b.reason, pickFor(b))}`;
   }
   const e = b.edition;
@@ -103,9 +103,7 @@ function editionSummary(b) {
       </div>`
     : '';
   return `
-    <div class="edition-title">${editionTitleLink(e, e.storygraph_book_id === b.storygraph_tag
-      ? 'The edition tagged in Audiobookshelf'
-      : e.read_by_you ? READ_EDITION_FALLBACK : 'The edition earlier syncs used')}</div>
+    <div class="edition-title">${editionTitleLink(e, editionFallbackTitle(e, b))}</div>
     <div class="text-dim">${editionDetails(e, b) || 'No format or runtime on file'}</div>
     ${b.state === 'suggested' ? matchReasonText(b.reason) + readEditionNote(b.reason, pickFor(b)) : ''}
     ${warning}${tagDiffers}`;
@@ -134,10 +132,9 @@ function rowActions(b) {
 
 function pickerHtml(b) {
   const id = jsArg(b.abs_item_id);
-  const others = b.candidates.filter(c => c.storygraph_book_id !== b.edition?.storygraph_book_id);
-  const pick = bookId => `pickEdition(${id}, ${jsArg(bookId)})`;
+  const others = otherCandidates(b.candidates, b.edition);
+  const pick = pickFor(b);
   const inputId = `q-${b.abs_item_id}`;
-  const pasteId = `u-${b.abs_item_id}`;
   return `
     <div class="edition-picker">
       ${others.length
@@ -151,13 +148,7 @@ function pickerHtml(b) {
         </div>
         <span class="hint">Useful when the top search result is the wrong book (a different work or a series box set).</span>
       </div>
-      <div class="field" style="margin-top:0.75rem">
-        <label for="${esc(pasteId)}">Or paste a StoryGraph book URL or id</label>
-        <div class="picker-row">
-          <input type="text" id="${esc(pasteId)}" placeholder="https://app.thestorygraph.com/books/...">
-          <button class="btn btn-ghost" onclick="pickEdition(${id}, document.getElementById(${jsArg(pasteId)}).value.trim())">Use this</button>
-        </div>
-      </div>
+      ${pasteEditionField('pickEdition', b.abs_item_id, `u-${b.abs_item_id}`, 'Or paste a StoryGraph book URL or id')}
     </div>`;
 }
 
@@ -257,7 +248,6 @@ async function pickEdition(itemId, storygraphBookId) {
       ...(d.tag_error ? {} : { storygraph_tag: d.edition.storygraph_book_id }),
     });
     expanded.delete(itemId);
-    toast(d.tag_error ? `✓ Edition confirmed. ${d.tag_error}.` : '✓ Edition confirmed', d.tag_error ? 'err' : 'ok');
   } catch (e) {
     toast(e.message || 'Could not use that edition', 'err');
   } finally {
