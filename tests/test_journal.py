@@ -1,6 +1,6 @@
 import unittest
 
-from journal import parse_journal_page, progress_dates
+from journal import journal_entry_ids, parse_journal_page, progress_dates, started_entry_ids
 
 # A representative excerpt of StoryGraph's /journal?book_id=<id> markup,
 # captured live: one status-only entry ("Started reading") and one
@@ -45,6 +45,21 @@ JOURNAL_HTML = """
 </span>
 """
 
+UNDATED_ENTRY = """
+  <div class="mb-3 grid grid-cols-4 md:grid-cols-6">
+    <div class="col-span-4 md:col-span-4 ml-2 md:ml-2">
+      <div class="mb-4">
+        <p class="font-semibold text-xs md:text-sm">No date
+        <a class=" pb-4 text-xs md:text-sm standard-link float-right" href="/journal_entries/0d0d0d0d-0000-0000-0000-000000000000/edit">Edit</a></p>
+      </div>
+      <div class="mt-2 mb-4">
+        <span class="inline-flex items-center px-2 py-1 rounded text-xs font-semibold">Finished</span>
+        <p class="clear-both text-xs font-medium">369 pages read <span class="font-normal">(369 pages out of 369)</span></p>
+      </div>
+    </div>
+  </div>
+"""
+
 
 class JournalParsingTests(unittest.TestCase):
     def test_parses_a_status_only_entry_with_no_percent(self):
@@ -58,6 +73,28 @@ class JournalParsingTests(unittest.TestCase):
         entry = entries["5a159496-b625-493b-96b2-81b3dffe9744"]
         self.assertEqual("2026-01-07", entry.date)
         self.assertEqual(13.0, entry.percent)
+
+    def test_an_undated_entry_does_not_borrow_a_neighbours_date(self):
+        # A book marked read without dates gets undated "Started reading" and
+        # "Finished" entries, listed after the dated ones. The page around the
+        # list is what an undated entry climbs into when nothing stops it.
+        entries_html = JOURNAL_HTML.rstrip()[: -len("</span>")] + UNDATED_ENTRY + "</span>"
+        page = f"<main><h2>Reading Journal</h2>{entries_html}</main>"
+        entries = {e.entry_id: e for e in parse_journal_page(page)}
+        self.assertEqual(
+            {"ea10c7b4-e467-4186-928b-35f847d9cad4", "5a159496-b625-493b-96b2-81b3dffe9744"}, set(entries),
+        )
+        self.assertEqual({"2026-01-07"}, progress_dates(entries.values()))
+
+    def test_lists_every_entry_and_picks_out_the_starts_dated_or_not(self):
+        undated_start = UNDATED_ENTRY.replace("Finished", "Started reading").replace("0d0d0d0d", "0e0e0e0e")
+        page = JOURNAL_HTML.rstrip()[: -len("</span>")] + UNDATED_ENTRY + undated_start + "</span>"
+
+        self.assertEqual(4, len(journal_entry_ids(page)))
+        self.assertEqual(
+            ["ea10c7b4-e467-4186-928b-35f847d9cad4", "0e0e0e0e-0000-0000-0000-000000000000"],
+            started_entry_ids(page),
+        )
 
     def test_deduplicates_by_entry_id(self):
         duplicated = JOURNAL_HTML + JOURNAL_HTML

@@ -16,7 +16,11 @@ async function sendJSON(url, body, method = 'POST') {
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const d = await r.json().catch(() => ({}));
-  if (!r.ok || d.error) throw new Error(d.error || `Request failed (HTTP ${r.status})`);
+  if (!r.ok || d.error) {
+    const err = new Error(d.error || `Request failed (HTTP ${r.status})`);
+    err.data = d;
+    throw err;
+  }
   return d;
 }
 

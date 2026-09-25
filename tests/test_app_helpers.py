@@ -211,11 +211,47 @@ def _book_page(label, progress=None):
     )
 
 
+_UNLABELLED_PAGE = '<input type="number" name="read_status[progress_number]" />'
+
+
+def _read_list(*read_ids):
+    """The add-a-read page, listing each existing read with its edit link."""
+    return "".join(
+        f'<a href="/read_instances/{read_id}/edit?book_id=b1">Edit</a>'
+        f'<a href="/remove-reread?book_id=b1&amp;read_instance_id={read_id}">Remove read</a>'
+        for read_id in read_ids
+    )
+
+
+def _read_form(read_id, start=("", "", ""), finish=("", "", "")):
+    """A read's edit form, shaped like StoryGraph's: a PATCH override and six
+    date selects, each with a blank option and the chosen one selected."""
+    def select(name, value):
+        return (
+            f'<select name="read_instance[{name}]"><option value="">-</option>'
+            + (f'<option selected="selected" value="{value}">{value}</option>' if value else "")
+            + "</select>"
+        )
+    fields = zip(("start_day", "start_month", "start_year", "day", "month", "year"), (*start, *finish))
+    return (
+        f'<form action="/read_instances/{read_id}" method="post">'
+        '<input type="hidden" name="_method" value="patch" />'
+        '<input type="hidden" name="authenticity_token" value="tok" />'
+        + "".join(select(name, value) for name, value in fields)
+        + f'<input type="hidden" name="read_instance_id" value="{read_id}" />'
+        '<input type="submit" name="commit" value="Update" /></form>'
+    )
+
+
 class StoryGraphPageTests(unittest.TestCase):
     def setUp(self):
         self.client = A.StoryGraphClient("session")
         self.posts = []
-        self.client._post = lambda path, data: self.posts.append(path) or _FakeResponse({})
+        self.post_status = 200
+        self.client._post = lambda path, data: self.posts.append(path) or _FakeResponse({}, self.post_status)
+        # What StoryGraph serves after a status POST, and on the add-a-read page.
+        self.pages = {"/books/b1": _book_page("read"), "/read_instances/new?book_id=b1": ""}
+        self.client._get = lambda path: _Resp(self.pages[path])
 
     def test_a_matching_status_is_not_posted_again(self):
         ok, already, html = self.client.ensure_status("b1", "currently-reading", html=_book_page("currently reading", 89))
@@ -225,10 +261,229 @@ class StoryGraphPageTests(unittest.TestCase):
         self.assertEqual(89.0, A._parse_current_progress(html))
 
     def test_currently_reading_does_not_count_as_read(self):
-        ok, already, _ = self.client.ensure_status("b1", "read", html=_book_page("currently reading"))
+        ok, already, html = self.client.ensure_status("b1", "read", html=_book_page("currently reading"))
+
+        self.assertEqual((True, False), (ok, already))
+        self.assertEqual(["/update-status.js?book_id=b1&status=read"], self.posts)
+        self.assertEqual(self.pages["/books/b1"], html)
+
+    def test_a_book_off_the_shelf_has_its_status_posted(self):
+        ok, already, _ = self.client.ensure_status("b1", "read", html=_UNLABELLED_PAGE)
 
         self.assertEqual((True, False), (ok, already))
         self.assertEqual(["/update-status.js?book_id=b1&status=read"], self.posts)
 
+    def test_a_status_the_page_does_not_show_after_posting_is_a_failure(self):
+        self.pages["/books/b1"] = _book_page("to read")
+
+        ok, _, _ = self.client.ensure_status("b1", "currently-reading", html=_book_page("to read"))
+
+        self.assertFalse(ok)
+
+    def test_a_book_still_off_the_shelf_after_posting_is_a_failure(self):
+        # A read on file doesn't make it one: StoryGraph can hold a read of a
+        # book that isn't on your shelf.
+        self.pages["/books/b1"] = _UNLABELLED_PAGE
+        self.pages["/read_instances/new?book_id=b1"] = _read_list("41")
+
+        for status in ("read", "currently-reading"):
+            ok, _, _ = self.client.ensure_status("b1", status, html=_book_page("to read"))
+            self.assertFalse(ok, status)
+
+    def test_a_rejected_post_is_a_failure_without_rereading_the_page(self):
+        self.post_status = 422
+        self.pages = {}
+
+        self.assertEqual((False, False, None), self.client.ensure_status("b1", "read", html=_book_page("to read")))
+
+    def test_being_signed_out_when_confirming_raises(self):
+        self.client._get = lambda path: _Resp("", url="https://app.thestorygraph.com/users/sign_in")
+
+        with self.assertRaises(A.StoryGraphAuthError):
+            self.client.ensure_status("b1", "read", html=_book_page("to read"))
+
     def test_cleared_progress_reads_as_unknown(self):
         self.assertIsNone(A._parse_current_progress(_book_page("currently reading")))
+
+
+class StoryGraphReadDateTests(unittest.TestCase):
+    EDIT = "/read_instances/42/edit?book_id=b1"
+
+    def setUp(self):
+        self.client = A.StoryGraphClient("session")
+        self.pages = {"/read_instances/new?book_id=b1": _read_list("42"), self.EDIT: _read_form("42")}
+        self.client._get = lambda path: _Resp(self.pages[path])
+        self.patches = []
+
+        def post(url, data=None, **kwargs):
+            self.patches.append((url, dict(data)))
+            # Echo the submitted dates back, as StoryGraph's edit form does.
+            dates = [data[f"read_instance[{name}]"] for name in ("start_day", "start_month", "start_year", "day", "month", "year")]
+            self.pages[self.EDIT] = _read_form("42", tuple(dates[:3]), tuple(dates[3:]))
+            return _Resp("", 200)
+        self.client._session.post = post
+
+    def test_lists_each_read_once_in_page_order(self):
+        self.pages["/read_instances/new?book_id=b1"] = _read_list("7", "42") + _read_list("7")
+
+        self.assertEqual(["7", "42"], self.client.read_ids("b1"))
+
+    def test_dates_a_read_through_its_edit_form(self):
+        ok = self.client.set_read_dates("b1", "42", A.date_cls(2026, 9, 5), A.date_cls(2026, 9, 15))
+
+        self.assertTrue(ok)
+        url, data = self.patches[0]
+        self.assertEqual("https://app.thestorygraph.com/read_instances/42", url)
+        self.assertEqual("patch", data["_method"])
+        self.assertEqual(
+            ("5", "9", "2026", "15", "9", "2026"),
+            tuple(data[f"read_instance[{name}]"] for name in ("start_day", "start_month", "start_year", "day", "month", "year")),
+        )
+        self.assertNotIn("commit", data)
+
+    def test_keeps_a_start_it_is_not_given_unless_it_is_after_the_finish(self):
+        self.pages[self.EDIT] = _read_form("42", ("20", "9", "2026"), ("25", "9", "2026"))
+
+        self.client.set_read_dates("b1", "42", None, A.date_cls(2026, 9, 22))
+        self.assertEqual("20", self.patches[-1][1]["read_instance[start_day]"])
+
+        self.client.set_read_dates("b1", "42", None, A.date_cls(2026, 9, 15))
+        self.assertEqual("15", self.patches[-1][1]["read_instance[start_day]"])
+
+    def test_a_date_the_form_does_not_show_afterwards_is_a_failure(self):
+        self.client._session.post = lambda url, data=None, **kwargs: _Resp("", 200)
+
+        self.assertFalse(self.client.set_read_dates("b1", "42", A.date_cls(2026, 9, 5), A.date_cls(2026, 9, 15)))
+
+    def test_marking_read_dates_only_the_read_it_adds(self):
+        self.pages["/books/b1"] = _book_page("currently reading")
+        self.pages["/read_instances/new?book_id=b1"] = _read_list("7")
+        self.pages["/read_instances/7/edit?book_id=b1"] = _read_form("7", ("1", "8", "2026"), ("10", "8", "2026"))
+        dated = []
+        self.client.set_read_dates = lambda book_id, read_id, started, finished: dated.append(read_id) or True
+
+        def post_status(path, data):
+            self.pages["/books/b1"] = _book_page("read")
+            self.pages["/read_instances/new?book_id=b1"] = _read_list("7", "42")
+            return _FakeResponse({})
+        self.client._post = post_status
+
+        ok, already, _ = self.client.mark_read("b1", A.date_cls(2026, 9, 5), A.date_cls(2026, 9, 15))
+
+        self.assertEqual((True, False), (ok, already))
+        self.assertEqual(["42"], dated)
+
+    def test_a_reread_never_starts_before_the_last_read_finished(self):
+        # ABS keeps a relistened book's first startedAt.
+        self.pages["/books/b1"] = _book_page("rereading")
+        self.pages["/read_instances/new?book_id=b1"] = _read_list("7")
+        self.pages["/read_instances/7/edit?book_id=b1"] = _read_form("7", ("1", "9", "2026"), ("10", "9", "2026"))
+        dated = []
+        self.client.set_read_dates = lambda book_id, read_id, started, finished: dated.append((started, finished)) or True
+
+        def post_status(path, data):
+            self.pages["/books/b1"] = _book_page("read")
+            self.pages["/read_instances/new?book_id=b1"] = _read_list("42", "7")
+            return _FakeResponse({})
+        self.client._post = post_status
+
+        self.client.mark_read("b1", A.date_cls(2026, 8, 1), A.date_cls(2026, 9, 20))
+        self.assertEqual([(A.date_cls(2026, 9, 10), A.date_cls(2026, 9, 20))], dated)
+
+    def test_a_book_already_read_is_neither_posted_nor_redated(self):
+        self.pages["/books/b1"] = _book_page("read")
+        self.client._post = lambda path, data: self.fail("posted a status")
+        self.client.set_read_dates = lambda *args: self.fail("redated a read")
+
+        self.assertEqual((True, True), self.client.mark_read("b1", A.date_cls(2026, 9, 5), A.date_cls(2026, 9, 15))[:2])
+
+
+def _journal(*entries):
+    """A journal page: (entry id, text) pairs, each its own entry block."""
+    return "".join(
+        f'<div class="entry"><p>No date <a href="/journal_entries/{entry_id}/edit">Edit</a></p>'
+        f"<span>{text}</span></div>"
+        for entry_id, text in entries
+    )
+
+
+START_A = "aaaaaaaa-0000-0000-0000-00000000000a"
+START_B = "bbbbbbbb-0000-0000-0000-00000000000b"
+
+
+class StoryGraphStartDateTests(unittest.TestCase):
+    EDIT = f"/journal_entries/{START_B}/edit"
+
+    def setUp(self):
+        self.client = A.StoryGraphClient("session")
+        # A reread: an old read's start is already in the journal.
+        self.pages = {
+            "/books/b1": _book_page("read"),
+            "/journal?book_id=b1&page=1": _journal((START_A, "Started reading"), ("c" * 8 + "-0000-0000-0000-00000000000c", "50%")),
+        }
+        self.client._get = lambda path: _Resp(self.pages.get(path, ""))
+        self.dated = []
+        self.client.set_journal_entry_date = lambda entry_id, value: self.dated.append((entry_id, value)) or True
+
+        def post_status(path, data):
+            self.pages["/books/b1"] = _book_page("rereading")
+            self.pages["/journal?book_id=b1&page=1"] += _journal((START_B, "Started reading"))
+            return _FakeResponse({})
+        self.client._post = post_status
+
+    def test_starting_dates_only_the_start_it_adds(self):
+        ok, already, _ = self.client.start_reading("b1", A.date_cls(2026, 9, 1))
+
+        self.assertEqual((True, False), (ok, already))
+        self.assertEqual([(START_B, A.date_cls(2026, 9, 1))], self.dated)
+
+    def test_a_reread_start_is_moved_up_to_the_last_finish(self):
+        self.pages["/read_instances/new?book_id=b1"] = _read_list("7")
+        self.pages["/read_instances/7/edit?book_id=b1"] = _read_form("7", ("1", "9", "2026"), ("10", "9", "2026"))
+
+        self.client.start_reading("b1", A.date_cls(2026, 8, 1))
+        self.assertEqual([(START_B, A.date_cls(2026, 9, 10))], self.dated)
+
+    def test_a_book_already_being_read_is_neither_posted_nor_redated(self):
+        self.pages["/books/b1"] = _book_page("currently reading")
+        self.client._post = lambda path, data: self.fail("posted a status")
+
+        self.assertEqual((True, True), self.client.start_reading("b1", A.date_cls(2026, 9, 1))[:2])
+        self.assertEqual([], self.dated)
+
+    def test_pages_through_the_journal_until_a_page_adds_nothing(self):
+        self.pages["/journal?book_id=b1&page=2"] = _journal((START_B, "Started reading"))
+        self.pages["/journal?book_id=b1&page=3"] = _journal((START_B, "Started reading"))
+
+        self.assertEqual({START_A, START_B}, self.client.started_entry_ids("b1"))
+
+    def test_moves_a_journal_entry_through_its_edit_form(self):
+        client = A.StoryGraphClient("session")
+        form = (
+            f'<form action="/journal_entries/{START_B}" method="post">'
+            '<input type="hidden" name="_method" value="put" />'
+            '<input type="hidden" name="authenticity_token" value="tok" />'
+            '<select name="journal_entry[day]"><option selected="selected" value="25">25</option></select>'
+            '<select name="journal_entry[month]"><option selected="selected" value="9">9</option></select>'
+            '<select name="journal_entry[year]"><option selected="selected" value="2026">2026</option></select>'
+            '<input type="number" name="journal_entry[percent_reached]" value="0" />'
+            '<input type="hidden" name="journal_entry[note]" />'
+            "</form>"
+        )
+        pages = {self.EDIT: form}
+        client._get = lambda path: _Resp(pages[path])
+        posts = []
+
+        def post(url, data=None, **kwargs):
+            posts.append((url, dict(data)))
+            pages[self.EDIT] = form.replace('value="25">25', 'value="1">1')
+            return _Resp("", 302)
+        client._session.post = post
+
+        self.assertTrue(client.set_journal_entry_date(START_B, A.date_cls(2026, 9, 1)))
+        url, data = posts[0]
+        self.assertEqual(f"https://app.thestorygraph.com/journal_entries/{START_B}", url)
+        self.assertEqual(("put", "1", "9", "2026", "0"), (
+            data["_method"], data["journal_entry[day]"], data["journal_entry[month]"],
+            data["journal_entry[year]"], data["journal_entry[percent_reached]"],
+        ))

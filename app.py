@@ -26,7 +26,7 @@ from matcher import (
     normalise_language, parse_filtered_editions, parse_storygraph_editions,
 )
 from history import build_history_preview, day_key
-from journal import parse_journal_page, progress_dates
+from journal import journal_entry_ids, parse_journal_page, progress_dates, started_entry_ids
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 
@@ -417,6 +417,9 @@ def _item_to_book(item: dict, progress: dict) -> dict | None:
         "current_minutes": round((progress.get("currentTime") or 0) / 60, 1),
         "duration_minutes": round((media.get("duration") or 0) / 60, 1),
         "is_finished": bool(progress.get("isFinished")),
+        # Epoch milliseconds, for dating a read on StoryGraph; see _read_dates.
+        "started_at": progress.get("startedAt"),
+        "finished_at": progress.get("finishedAt"),
     }
     book["state_key"] = _book_state_key(book)
     return book
@@ -557,6 +560,51 @@ def _parse_read_status(html: str) -> str:
     so match read-status-label as one class token among them."""
     m = re.search(r'class="(?:[^"]*\s)?read-status-label(?:\s[^"]*)?"[^>]*>([^<]+)<', html)
     return " ".join(m.group(1).split()).lower() if m else ""
+
+
+def _form_data(html: str, action: str) -> dict | None:
+    """What a browser would submit from the form posting to `action` as it
+    stands, e.g. a read's edit form: its PATCH override, token, ids and six
+    date selects (blank when undated)."""
+    form = BeautifulSoup(html, "html.parser").find("form", action=action)
+    if form is None:
+        return None
+    data = {}
+    for field in form.find_all(["input", "select", "textarea"]):
+        name = field.get("name")
+        if not name or field.get("type") in {"submit", "button"}:
+            continue
+        if field.name == "select":
+            option = field.find("option", selected=True)
+            data[name] = option.get("value", "") if option else ""
+        elif field.name == "textarea":
+            data[name] = field.get_text()
+        else:
+            data[name] = field.get("value", "")
+    return data
+
+
+def _read_date_fields(prefix: str, value: date_cls) -> dict:
+    """A read form's day/month/year selects; prefix "start_" for its start."""
+    return {
+        f"read_instance[{prefix}day]": str(value.day),
+        f"read_instance[{prefix}month]": str(value.month),
+        f"read_instance[{prefix}year]": str(value.year),
+    }
+
+
+def _read_form_date(data: dict, prefix: str) -> date_cls | None:
+    try:
+        return date_cls(*(int(data[f"read_instance[{prefix}{part}]"]) for part in ("year", "month", "day")))
+    except (KeyError, ValueError):
+        return None
+
+
+def _status_matches(label: str, target_status: str) -> bool:
+    # Exact match: "read" is a substring of "currently reading".
+    return label == _STATUS_LABELS[target_status] or (
+        target_status == "currently-reading" and "rereading" in label
+    )
 
 
 def _parse_current_progress(html) -> float | None:
@@ -702,26 +750,161 @@ class StoryGraphClient:
     def get_book_page(self, book_id) -> str:
         return self._get(f"/books/{book_id}").text
 
+    def _get_signed_in(self, path) -> str:
+        resp = self._get(path)
+        if "sign_in" in resp.url:
+            raise StoryGraphAuthError("StoryGraph session invalid — update it in Settings")
+        resp.raise_for_status()
+        return resp.text
+
+    def read_ids(self, book_id) -> list[str]:
+        """Every finished read StoryGraph has for this book, newest first. The
+        page for adding a read links to each one's edit form. A book that's
+        only currently reading has none yet: the read is made when it's
+        finished."""
+        html = self._get_signed_in(f"/read_instances/new?book_id={book_id}")
+        return list(dict.fromkeys(re.findall(r"/read_instances/(\d+)/edit", html)))
+
+    def set_read_dates(self, book_id, read_id, started: date_cls | None, finished: date_cls | None) -> bool:
+        """Date one read through its edit form, leaving a date passed as None
+        as it is. The read's "Started reading" and "Finished" journal entries
+        move with it. True once the form shows the new dates."""
+        path, action = f"/read_instances/{read_id}/edit?book_id={book_id}", f"/read_instances/{read_id}"
+        data = _form_data(self._get_signed_in(path), action)
+        if data is None:
+            logger.warning("No edit form for read %s of %s", read_id, book_id)
+            return False
+        changes = {}
+        if started:
+            changes.update(_read_date_fields("start_", started))
+        if finished:
+            changes.update(_read_date_fields("", finished))
+            # StoryGraph starts a read on the day it saw the book started,
+            # which can be later than a finish date taken from ABS.
+            current_start = _read_form_date({**data, **changes}, "start_")
+            if current_start and current_start > finished:
+                changes.update(_read_date_fields("start_", finished))
+        ok = self._save_form(path, action, data, changes)
+        logger.info("Dated read %s of %s (%s to %s): %s", read_id, book_id, started, finished, "ok" if ok else "failed")
+        return ok
+
+    def set_journal_entry_date(self, entry_id, value: date_cls) -> bool:
+        """Move one journal entry to another day through its edit form,
+        keeping everything else it records."""
+        path, action = f"/journal_entries/{entry_id}/edit", f"/journal_entries/{entry_id}"
+        data = _form_data(self._get_signed_in(path), action)
+        if data is None:
+            logger.warning("No edit form for journal entry %s", entry_id)
+            return False
+        changes = {f"journal_entry[{part}]": str(getattr(value, part)) for part in ("day", "month", "year")}
+        ok = self._save_form(path, action, data, changes)
+        logger.info("Dated journal entry %s to %s: %s", entry_id, value, "ok" if ok else "failed")
+        return ok
+
+    def _save_form(self, page_path: str, action: str, data: dict, changes: dict) -> bool:
+        """Submit an edit form as it stood (`data`) with `changes` applied,
+        true once the form, read again, shows them."""
+        r = self._session.post(
+            f"{STORYGRAPH_BASE}{action}", data={**data, **changes},
+            headers={"X-CSRF-Token": self._last_csrf, "Referer": f"{STORYGRAPH_BASE}{page_path}"},
+            allow_redirects=False, timeout=15,
+        )
+        if r.status_code not in (200, 302, 303):
+            logger.warning("StoryGraph refused %s: HTTP %s", action, r.status_code)
+            return False
+        saved = _form_data(self._get_signed_in(page_path), action) or {}
+        return all(saved.get(name) == value for name, value in changes.items())
+
+    def latest_finish(self, book_id, read_ids) -> date_cls | None:
+        """When the latest of these reads finished, from their edit forms."""
+        finishes = []
+        for read_id in read_ids:
+            path = f"/read_instances/{read_id}/edit?book_id={book_id}"
+            finish = _read_form_date(_form_data(self._get_signed_in(path), f"/read_instances/{read_id}") or {}, "")
+            if finish:
+                finishes.append(finish)
+        return max(finishes, default=None)
+
+    def _after_earlier_reads(self, book_id, started: date_cls, read_ids) -> date_cls:
+        """`started`, moved up to the end of the book's latest earlier read if
+        it's before it. StoryGraph labels a journal's "Started reading" entries
+        by date, so a reread dated before the last read turns that read's own
+        start into a plain 0% entry. ABS keeps a book's first startedAt when
+        it's relistened, so this happens unless prevented."""
+        latest = self.latest_finish(book_id, read_ids) if read_ids else None
+        return max(started, latest) if latest else started
+
+    def start_reading(self, book_id, started: date_cls | None = None) -> tuple[bool, bool, str | None]:
+        """ensure_status(book_id, "currently-reading"), then move the "Started
+        reading" entry that adds, which StoryGraph dates today, to the day
+        the book was really started. As with mark_read, a start that can't be
+        dated still counts."""
+        html = self.get_book_page(book_id)
+        if not started or _status_matches(_parse_read_status(html), "currently-reading"):
+            return self.ensure_status(book_id, "currently-reading", html=html)
+        started = self._after_earlier_reads(book_id, started, self.read_ids(book_id))
+        before = self.started_entry_ids(book_id)
+        result = self.ensure_status(book_id, "currently-reading", html=html)
+        if result[0]:
+            added = self.started_entry_ids(book_id) - before
+            if len(added) != 1 or not self.set_journal_entry_date(next(iter(added)), started):
+                logger.warning("Set %s to currently reading but couldn't date its start (%d new)", book_id, len(added))
+        return result
+
+    def mark_read(
+        self, book_id, started: date_cls | None = None, finished: date_cls | None = None,
+    ) -> tuple[bool, bool, str | None]:
+        """ensure_status(book_id, "read"), then give the read that adds these
+        dates. Left alone, StoryGraph dates it from the day the book was set
+        to currently reading here to today, or not at all if it never was.
+        A read that can't be dated is still a read, so that only logs."""
+        html = self.get_book_page(book_id)
+        if not (started or finished) or _status_matches(_parse_read_status(html), "read"):
+            return self.ensure_status(book_id, "read", html=html)
+        before = set(self.read_ids(book_id))
+        if started:
+            started = self._after_earlier_reads(book_id, started, before)
+            finished = max(finished, started) if finished else None
+        result = self.ensure_status(book_id, "read", html=html)
+        if result[0]:
+            added = [read_id for read_id in self.read_ids(book_id) if read_id not in before]
+            if len(added) != 1 or not self.set_read_dates(book_id, added[0], started, finished):
+                logger.warning("Marked %s read but couldn't date it (%d new reads)", book_id, len(added))
+        return result
+
     def ensure_status(self, book_id, target_status, html: str | None = None) -> tuple[bool, bool, str | None]:
         """Returns (ok, already_matched, html) — already_matched is True when the book's
         StoryGraph status already matched target_status and nothing was posted. html is
-        the page markup the match was read from (reusable for a progress check), or None
-        if a status-changing POST was made and any previously-fetched markup is now stale."""
+        the book page as it stands after the call (reusable for a progress check), or
+        None if a status POST failed. A book not on your shelf has no status label."""
         html = html if html is not None else self.get_book_page(book_id)
         current = _parse_read_status(html)
-        # Exact match: "read" is a substring of "currently reading". Re-posting
-        # the status a book already has is not a no-op on StoryGraph — it appears
-        # to wipe the book's current progress, which the daily run never rewrites.
-        if current == _STATUS_LABELS[target_status] or (
-            target_status == "currently-reading" and "rereading" in current
-        ):
+        # Re-posting the status a book already has is not a no-op on StoryGraph —
+        # it appears to wipe the book's current progress, which the daily run
+        # never rewrites, and for "read" adds a second read.
+        if _status_matches(current, target_status):
             return True, True, html
         r = self._post(
             f"/update-status.js?book_id={book_id}&status={target_status}",
             {"authenticity_token": self._last_csrf},
         )
         logger.info("Set status=%s for %s: HTTP %s", target_status, book_id, r.status_code)
-        return r.status_code in (200, 302), False, None
+        if r.status_code not in (200, 302):
+            return False, False, None
+        return self._confirm_status(book_id, target_status)
+
+    def _confirm_status(self, book_id, target_status) -> tuple[bool, bool, str]:
+        """Re-read the book after a status POST. StoryGraph can accept a request
+        without making the change, and a write reported as done is recorded as
+        synced and never retried, so it only counts once the page agrees."""
+        html = self._get_signed_in(f"/books/{book_id}")
+        current = _parse_read_status(html)
+        if _status_matches(current, target_status):
+            return True, False, html
+        logger.warning(
+            "StoryGraph shows %s as '%s' after setting %s", book_id, current or "not on your shelf", target_status,
+        )
+        return False, False, html
 
     def update_progress(self, book_id, progress_percent, html: str | None = None) -> bool:
         html = html if html is not None else self.get_book_page(book_id)
@@ -738,26 +921,29 @@ class StoryGraphClient:
         logger.info("Progress for %s -> %.1f%%: HTTP %s", book_id, progress_percent, r.status_code)
         return ok
 
-    def get_logged_progress_dates(self, book_id) -> set[str]:
-        """The dates StoryGraph already has a *progress* entry on for this book
-        (status-only entries excluded, see journal.progress_dates).
-
-        The journal renders ~20 entries per page, so this pages until one adds
-        nothing new, capped since StoryGraph documents no limit."""
-        seen_ids: set[str] = set()
-        dates: set[str] = set()
-        page = 1
-        while page <= 50:
+    def _journal_pages(self, book_id):
+        """Each page of this book's journal. It renders ~20 entries a page, so
+        this pages until one adds no entry, capped since StoryGraph documents
+        no limit."""
+        seen: set[str] = set()
+        for page in range(1, 51):
             resp = self._get(f"/journal?book_id={book_id}&page={page}")
             if resp.status_code != 200:
-                break
-            new_entries = [e for e in parse_journal_page(resp.text) if e.entry_id not in seen_ids]
-            if not new_entries:
-                break
-            seen_ids.update(e.entry_id for e in new_entries)
-            dates |= progress_dates(new_entries)
-            page += 1
-        return dates
+                return
+            ids = set(journal_entry_ids(resp.text))
+            if not ids - seen:
+                return
+            seen |= ids
+            yield resp.text
+
+    def get_logged_progress_dates(self, book_id) -> set[str]:
+        """The dates StoryGraph already has a *progress* entry on for this book
+        (status-only entries excluded, see journal.progress_dates)."""
+        entries = {entry.entry_id: entry for html in self._journal_pages(book_id) for entry in parse_journal_page(html)}
+        return progress_dates(entries.values())
+
+    def started_entry_ids(self, book_id) -> set[str]:
+        return {entry_id for html in self._journal_pages(book_id) for entry_id in started_entry_ids(html)}
 
     def add_dated_progress_entry(self, book_id, date: str, percent: float) -> bool:
         """Writes one backdated journal entry via StoryGraph's 'Add note/Edit
@@ -932,7 +1118,12 @@ def do_sync(
                     results.append(_sync_result(book, "failed"))
                     continue
 
-            ok, already_matched, status_html = client.ensure_status(book_id, status)
+            if status == "read":
+                ok, already_matched, status_html = client.mark_read(book_id, *_read_dates(user_id, book))
+            elif status == "currently-reading":
+                ok, already_matched, status_html = client.start_reading(book_id, _read_dates(user_id, book)[0])
+            else:
+                ok, already_matched, status_html = client.ensure_status(book_id, status)
             if not ok:
                 results.append(_sync_result(book, "failed"))
                 continue
@@ -1008,12 +1199,28 @@ def _parse_daily_sync_time(value: str) -> tuple[int, int]:
     return parsed.hour, parsed.minute
 
 
-def _daily_schedule(user_id: str, now: datetime | None = None) -> tuple[bool, str]:
-    timezone_name = cfg(user_id, "TIMEZONE", DEFAULT_TIMEZONE)
+def _user_timezone(user_id: str) -> ZoneInfo:
     try:
-        user_timezone = ZoneInfo(timezone_name)
+        return ZoneInfo(cfg(user_id, "TIMEZONE", DEFAULT_TIMEZONE))
     except ZoneInfoNotFoundError:
-        user_timezone = ZoneInfo(DEFAULT_TIMEZONE)
+        return ZoneInfo(DEFAULT_TIMEZONE)
+
+
+def _abs_date(user_id: str, epoch_ms) -> date_cls | None:
+    """The user's local date of an ABS timestamp, or None if there isn't one."""
+    try:
+        return datetime.fromtimestamp(float(epoch_ms) / 1000, tz=_user_timezone(user_id)).date()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def _read_dates(user_id: str, book: dict) -> tuple[date_cls | None, date_cls | None]:
+    """When ABS says a finished book was started and finished."""
+    return _abs_date(user_id, book.get("started_at")), _abs_date(user_id, book.get("finished_at"))
+
+
+def _daily_schedule(user_id: str, now: datetime | None = None) -> tuple[bool, str]:
+    user_timezone = _user_timezone(user_id)
     local_now = (now or datetime.now(timezone.utc)).astimezone(user_timezone)
     try:
         hour, minute = _parse_daily_sync_time(cfg(user_id, "DAILY_SYNC_TIME", DEFAULT_DAILY_SYNC_TIME))
@@ -1057,6 +1264,39 @@ def _history_checkpoints(
     return checkpoints
 
 
+def _history_read_dates(
+    user_id: str, book: dict, checkpoints: dict[str, dict], keys,
+) -> tuple[date_cls | None, date_cls | None]:
+    """The start and finish for a read holding the listening days at `keys`:
+    ABS's own dates, widened to take them all in. Only the days imported
+    count, since a relistened book's history also holds its earlier listens."""
+    started, finished = _read_dates(user_id, book)
+    days = sorted(date_cls.fromisoformat(checkpoints[key]["date"]) for key in keys if key in checkpoints)
+    if days:
+        started = min(started or days[0], days[0])
+        finished = max(finished or days[-1], days[-1])
+    return started, finished
+
+
+def _finish_imported_book(
+    client: StoryGraphClient,
+    user_id: str,
+    book: dict,
+    storygraph_book_id: str,
+    checkpoints: dict[str, dict],
+    requested: set[str],
+    results: list[dict],
+) -> str:
+    """Mark a book ABS has as finished read, once its days are in, with the
+    read dated to span them. StoryGraph only files an entry under the read in
+    progress, and any entry on a read book starts a new read, so while a day
+    has failed the book stays currently reading for a retry to finish."""
+    if any(result["status"] == "failed" for result in results):
+        return "left_currently_reading"
+    ok, _, _ = client.mark_read(storygraph_book_id, *_history_read_dates(user_id, book, checkpoints, requested))
+    return "marked_read" if ok else "failed"
+
+
 class HistoryReconcileError(Exception):
     """A book-level precondition failed before dated writes could be checked."""
 
@@ -1070,15 +1310,19 @@ def _reconcile_history_checkpoints(
     client: StoryGraphClient,
     label: str,
     ensure_read_status: bool = True,
+    started: date_cls | None = None,
 ) -> list[dict]:
     """Write and verify trusted daily checkpoints for manual and daily sync.
 
     `requested` contains checkpoint keys, never caller-supplied dates or
     percentages. Both call sites therefore share exactly the same duplicate
     checks, durable import state, write path, and post-write verification.
+    With ensure_read_status, the book is first set to currently reading,
+    since StoryGraph only keeps a dated entry for a read in progress, and a
+    start that adds is dated `started`.
     """
     if ensure_read_status:
-        status_ok, _, _ = client.ensure_status(storygraph_book_id, "currently-reading")
+        status_ok, _, _ = client.start_reading(storygraph_book_id, started)
         if not status_ok:
             raise HistoryReconcileError(
                 "Could not set this book to 'currently reading' on StoryGraph, "
@@ -1222,6 +1466,43 @@ def _daily_history_sync(
     return all_ok
 
 
+def _finish_daily_history(
+    user_id: str,
+    book: dict,
+    client: StoryGraphClient,
+    label: str,
+    start_date: date_cls,
+    end_date: date_cls,
+) -> bool:
+    """Write a just-finished book's listening days, through the finish day,
+    before it's marked read. StoryGraph only keeps a dated entry for a read in
+    progress, so they can't wait for the next daily run. False leaves the
+    finish unhandled, for the next poll to retry."""
+    item_id = book.get("abs_item_id")
+    storygraph_book_id = _confirmed_edition_id(user_id, item_id)
+    if not storygraph_book_id:
+        return True  # do_sync reports it as needing an edition
+    try:
+        if _parse_read_status(client.get_book_page(storygraph_book_id)) == "read":
+            return True  # already finished there; more entries would start a reread
+        checkpoints = _history_checkpoints(
+            get_abs_listening_sessions(user_id, item_id), book.get("duration_minutes", 0), start_date, end_date,
+        )
+        if not checkpoints:
+            return True
+        results = _reconcile_history_checkpoints(
+            user_id, item_id, storygraph_book_id, checkpoints, set(checkpoints), client, label,
+            started=_read_dates(user_id, book)[0],
+        )
+    except (req.RequestException, ValueError, HistoryReconcileError) as exc:
+        logger.warning("[%s] Finish history failed for '%s': %s", label, book["title"], exc)
+        return False
+    written = sum(1 for result in results if result["status"] == "success")
+    logger.info("[%s] Finish history for '%s' (%s to %s): %d/%d days written",
+                label, book["title"], start_date, end_date, written, len(results))
+    return not any(result["status"] == "failed" for result in results)
+
+
 def _mark_handled_lifecycle(state: dict, progress: dict, item_id: str):
     started, finished = _progress_lifecycle(progress)
     item_state = state.setdefault("books", {}).setdefault(item_id, {})
@@ -1261,28 +1542,10 @@ def _poll_user(user: dict, now: datetime | None = None):
 
         daily_due, local_date = _daily_schedule(user_id, now)
         scheduled_run = mode == "daily" and daily_due
-        pending_daily = set(scheduler_state.get("pending_daily_items", []))
-        if mode == "daily" and changes:
-            # A finished book can leave the default In Progress scope before
-            # midnight. Retain lifecycle items until their completed listening
-            # days have been reconciled successfully.
-            pending_daily.update(changes)
-            scheduler_state["pending_daily_items"] = sorted(pending_daily)
 
         scoped_books = []
         if mode == "frequent" or scheduled_run:
             scoped_books = get_abs_books(user_id, scope, progress_by_item=progress_by_item)
-            if scheduled_run:
-                present = {_book_state_key(book) for book in scoped_books}
-                for item_id in sorted(pending_daily - present):
-                    progress = progress_by_item.get(item_id)
-                    book = get_abs_book(user_id, item_id, progress) if progress is not None else None
-                    if book:
-                        scoped_books.append(book)
-                    else:
-                        # Removed from ABS since it finished. Waiting for it
-                        # would block every other book's daily run forever.
-                        logger.warning("[%s] Daily sync: ABS item %s is gone; dropping it", label, item_id)
             _cache_books(user_id, scope, scoped_books)
 
         selected = _frequent_sync_candidates(user_id, scoped_books) if mode == "frequent" else []
@@ -1300,6 +1563,17 @@ def _poll_user(user: dict, now: datetime | None = None):
 
         client = _storygraph_client(user_id)
         lifecycle_books = list(by_item.values())
+        if mode == "daily":
+            # A finish writes its own last listening days before the book is
+            # marked read, and the daily run leaves finished books alone.
+            history_start, _ = _daily_history_range(scheduler_state, local_date)
+            lifecycle_books = [
+                book for book in lifecycle_books
+                if not (book["is_finished"] and changes.get(_book_state_key(book), {}).get("finish"))
+                or _finish_daily_history(
+                    user_id, book, client, label, history_start, date_cls.fromisoformat(local_date),
+                )
+            ]
         if lifecycle_books:
             start_before_finish = {
                 item_id
@@ -1336,6 +1610,10 @@ def _poll_user(user: dict, now: datetime | None = None):
             history_books = []
             retry = False
             for book, result in zip(scoped_books, status_results):
+                if book["is_finished"]:
+                    # Its finish already wrote its last days; any more on a
+                    # book read on StoryGraph would start another read.
+                    continue
                 if result["status"] in {"success", "unchanged"}:
                     history_books.append(book)
                 elif result["status"] == "needs_edition":
@@ -1356,7 +1634,6 @@ def _poll_user(user: dict, now: datetime | None = None):
             )
             if history_ok and not retry:
                 scheduler_state["last_daily_run"] = local_date
-                scheduler_state["pending_daily_items"] = []
             else:
                 logger.warning(
                     "[%s] Daily history incomplete; it will retry without duplicating verified days",
@@ -1816,10 +2093,12 @@ def api_history_import(item_id):
     malformed one. A key whose day has since shifted simply won't match the
     rebuilt set and is reported back as a stale preview."""
     user_id = g.user["id"]
-    days = (request.json or {}).get("days")
+    body = request.json or {}
+    days = body.get("days")
     requested = {k for k in days if isinstance(k, str)} if isinstance(days, list) else set()
     if not requested:
         return jsonify({"error": "No days were confirmed for import"}), 400
+    allow_reread = body.get("allow_reread") is True
 
     storygraph_book_id = _confirmed_edition_id(user_id, item_id)
     if not storygraph_book_id:
@@ -1841,6 +2120,13 @@ def api_history_import(item_id):
         if not client.check_auth():
             return jsonify({"error": "StoryGraph session invalid — update it in Settings"}), 401
         with _user_lock(user_id):
+            # StoryGraph starts a new read for every journal entry on a book
+            # it has as read, so importing into one is a reread; ask first.
+            if not allow_reread and _parse_read_status(client.get_book_page(storygraph_book_id)) == "read":
+                return jsonify({
+                    "error": "This book is already marked read on StoryGraph",
+                    "already_read": True,
+                }), 409
             results = _reconcile_history_checkpoints(
                 user_id,
                 item_id,
@@ -1849,6 +2135,11 @@ def api_history_import(item_id):
                 requested,
                 client,
                 label,
+                started=_history_read_dates(user_id, book, checkpoints, requested)[0],
+            )
+            finish = (
+                _finish_imported_book(client, user_id, book, storygraph_book_id, checkpoints, requested, results)
+                if book["is_finished"] else None
             )
     except HistoryReconcileError as exc:
         return jsonify({"error": str(exc)}), 502
@@ -1857,7 +2148,7 @@ def api_history_import(item_id):
         return jsonify({"error": "Could not reach StoryGraph"}), 502
     imported = sum(1 for r in results if r["status"] == "success")
     logger.info("[%s] History import for %s: %d/%d days written", label, item_id, imported, len(results))
-    return jsonify({"imported": imported, "total": len(results), "results": results})
+    return jsonify({"imported": imported, "total": len(results), "results": results, "finish": finish})
 
 
 @app.route("/api/editions")

@@ -122,7 +122,7 @@ Each user can choose:
 - **Every N Minutes** (default, N from `POLL_INTERVAL`) — progress is pushed after at least `SYNC_THRESHOLD_MINUTES` of additional listening
 - **Daily** — at the selected local time (midnight by default), completed Audiobookshelf listening days are reconciled to dated StoryGraph progress entries
 
-The app still checks Audiobookshelf every `POLL_INTERVAL` seconds in Daily mode, but only contacts StoryGraph when a book starts, a book finishes, the daily run is due, or the user selects **Sync Now**. At midnight, it reconciles the previous day's ABS checkpoint using the same duplicate-safe, verified write path as History Import, so the entry keeps the day the listening happened. After downtime it catches up missed completed days; the first daily run only considers yesterday and never sweeps older history automatically. Finished books are retained until that final listening day has been checked. The first check after enabling this version quietly records existing books so old starts and finishes are not replayed.
+The app still checks Audiobookshelf every `POLL_INTERVAL` seconds in Daily mode, but only contacts StoryGraph when a book starts, a book finishes, the daily run is due, or the user selects **Sync Now**. At midnight, it reconciles the previous day's ABS checkpoint using the same duplicate-safe, verified write path as History Import, so the entry keeps the day the listening happened. After downtime it catches up missed completed days; the first daily run only considers yesterday and never sweeps older history automatically. The daily run only covers books you're still reading. A book that finishes has its remaining days, including the finish day, written straight away, and is then marked read, since StoryGraph can't take a dated entry for a book it already has as read. The first check after enabling this version quietly records existing books so old starts and finishes are not replayed.
 
 ## Editions
 
@@ -156,6 +156,19 @@ whole ABS library, whatever your sync scope:
 Upgrading from an earlier version: editions picked by hand in History Import stay
 confirmed. Editions that sync or History Import chose automatically show up as
 suggestions and need one click to confirm before sync writes to them again.
+
+## Dates on StoryGraph
+
+When a book is set to currently reading or marked read, StoryGraph dates it by
+the day that happens, or leaves it undated. The app then moves those dates to when
+Audiobookshelf says you started and finished, so a late sync or a History
+Import doesn't show a book as started on the day it was imported.
+
+History Import writes a book's days while it's currently reading, and marks a
+finished book read only once they're all in: StoryGraph files a dated entry
+under the read in progress, and treats one on a book it already has as read as
+the start of a reread. Importing into a book already marked read asks first,
+and adds the days as a reread if you go ahead.
 
 ## How it works
 

@@ -307,23 +307,53 @@ function resultRow(status, title, detail = '') {
     </div>`;
 }
 
-async function confirmImport() {
+const FINISH_NOTES = {
+  marked_read: 'Marked read on StoryGraph, dated from your Audiobookshelf listening.',
+  left_currently_reading: 'Left as currently reading on StoryGraph because some days failed. Import again to retry them; the book is marked read once they are all in.',
+  failed: 'The days were written, but marking the book read on StoryGraph failed. Import again to retry it.',
+};
+
+async function confirmImport(allowReread = false) {
   const { itemId } = historyView;
   const review = document.getElementById('import-review');
   review.innerHTML = '<div class="empty-state">Writing to StoryGraph…</div>';
   try {
     // Keys only — the server rebuilds each checkpoint's date and percentage
     // from Audiobookshelf before writing anything.
-    const result = await sendJSON(`/api/history-import/${encodeURIComponent(itemId)}`, { days: [...selectedDays] });
+    const result = await sendJSON(`/api/history-import/${encodeURIComponent(itemId)}`, {
+      days: [...selectedDays],
+      allow_reread: allowReread,
+    });
     const rows = (result.results || []).map(res => resultRow(
       res.status,
       res.date,
       res.reason ? `<span class="text-dim">${esc(res.reason.replace(/_/g, ' '))}</span>` : '',
     )).join('');
-    review.innerHTML = `<div class="history-note">Imported ${result.imported} of ${result.total}. Re-open History to see updated status.</div>${rows}`;
+    const finish = FINISH_NOTES[result.finish] ? ` ${FINISH_NOTES[result.finish]}` : '';
+    review.innerHTML = `<div class="history-note">Imported ${result.imported} of ${result.total}.${esc(finish)} Re-open History to see updated status.</div>${rows}`;
   } catch (e) {
+    if (e.data && e.data.already_read) {
+      askReread(review);
+      return;
+    }
     review.innerHTML = `<div class="empty-state">${esc(e.message || 'Import failed')}</div>`;
   }
+}
+
+function askReread(review) {
+  // StoryGraph files every journal entry on a book it has as read under a
+  // new read, so these days can only go in as a reread.
+  review.innerHTML = `
+    <div class="history-note">
+      This book is already marked read on StoryGraph. Importing these days
+      will add them as a <strong>reread</strong>: a second read of the book
+      alongside the one already there. To keep a single read instead, remove
+      the book from your shelf on StoryGraph and import again.
+    </div>
+    <div style="margin-top:0.75rem">
+      <button class="btn btn-primary" onclick="confirmImport(true)">Import as a reread</button>
+      <button class="btn btn-ghost" style="margin-left:0.5rem" onclick="renderHistory()">Cancel</button>
+    </div>`;
 }
 
 async function submitManualEdition(itemId) {

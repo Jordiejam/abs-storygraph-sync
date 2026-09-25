@@ -25,6 +25,34 @@ class JournalEntry:
     percent: float | None
 
 
+def _entry_ids(tag) -> list[str]:
+    """The ids of the journal entries inside tag, in page order."""
+    return list(dict.fromkeys(
+        _ENTRY_PATH_RE.search(link["href"]).group(1) for link in tag.find_all("a", href=_ENTRY_PATH_RE)
+    ))
+
+
+def journal_entry_ids(html: str) -> list[str]:
+    """Every entry on a journal page, dated or not."""
+    return _entry_ids(BeautifulSoup(html, "html.parser"))
+
+
+def started_entry_ids(html: str) -> list[str]:
+    """The "Started reading" entries on a journal page, dated or not: one per
+    read, begun when the book was set to currently reading."""
+    soup = BeautifulSoup(html, "html.parser")
+    started = []
+    for entry_id in _entry_ids(soup):
+        link = soup.find("a", href=re.compile(re.escape(f"/journal_entries/{entry_id}/edit")))
+        # The whole entry is the largest ancestor that holds no other entry.
+        block = link
+        while block.parent is not None and len(_entry_ids(block.parent)) == 1:
+            block = block.parent
+        if "Started reading" in block.get_text(" ", strip=True):
+            started.append(entry_id)
+    return started
+
+
 def _entry_container(link):
     """Return the ancestor holding one full entry (date row + status/percent row).
 
@@ -33,11 +61,17 @@ def _entry_container(link):
     date-only text before an ancestor's text actually grows to include the
     status/percent content too — that first ancestor whose text differs from
     the date-only row is the full entry.
+
+    An undated entry ("No date") never matches a date on its own, so climbing
+    stops at the first ancestor holding another entry: past that, the date and
+    percent found would be a neighbour's.
     """
     date_row_text = None
     for parent in link.parents:
         if getattr(parent, "name", None) in {"body", "html"}:
             break
+        if len(_entry_ids(parent)) > 1:
+            return None
         text = parent.get_text(" ", strip=True)
         if not _ENTRY_DATE_RE.search(text):
             continue

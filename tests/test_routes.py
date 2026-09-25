@@ -55,12 +55,14 @@ class FakeStoryGraph:
     write_result = True          # True/False, or a dict of date -> bool
     drop_writes = False          # accept the POST but never actually record it
     search_signed_out = False    # StoryGraph bounces the search to its sign-in page
+    shelf_label = ""             # the book page's status label; "" is off your shelf
 
     @classmethod
     def reset(cls):
         cls.journal, cls.editions = {}, [AUDIO, PRINT]
         cls.auth_ok = cls.status_ok = cls.write_result = True
         cls.drop_writes = cls.search_signed_out = False
+        cls.shelf_label = ""
         cls.instances = []
 
     def check_auth(self):
@@ -68,7 +70,8 @@ class FakeStoryGraph:
 
     def get_book_page(self, book_id):
         self.calls.append(("book_page", book_id))
-        return "<html><head><title>Picked Edition | The StoryGraph</title></head><body>ok</body></html>"
+        label = f'<button class="read-status-label">{FakeStoryGraph.shelf_label}</button>' if FakeStoryGraph.shelf_label else ""
+        return f"<html><head><title>Picked Edition | The StoryGraph</title></head><body>ok{label}</body></html>"
 
     def load_editions(self, query, language=None):
         self.calls.append(("load_editions", query))
@@ -81,8 +84,16 @@ class FakeStoryGraph:
         self.calls.append(("journal", book_id))
         return {d for d, pct in FakeStoryGraph.journal.items() if pct is not None}
 
+    def start_reading(self, book_id, started=None):
+        self.calls.append(("start_reading", book_id, started))
+        return self.ensure_status(book_id, "currently-reading")
+
+    def mark_read(self, book_id, started=None, finished=None):
+        self.calls.append(("mark_read", book_id, started, finished))
+        return self.ensure_status(book_id, "read")
+
     def ensure_status(self, book_id, status):
-        self.calls.append(("ensure_status", book_id))
+        self.calls.append(("ensure_status", book_id, status))
         # The real call creates a status-only journal entry dated today; a
         # regression here would let it block that day's own import.
         FakeStoryGraph.journal.setdefault("2026-01-05", None)
@@ -309,6 +320,78 @@ class ImportWriteTests(_ImportRouteCase):
         self.assertEqual({"success"}, {r["status"] for r in body["results"]})
         self.assertEqual(3, len(self.stored()["imported_days"]))
 
+    def storygraph_calls(self):
+        return [
+            c for c in FakeStoryGraph.instances[-1].calls
+            if c[0] in {"start_reading", "ensure_status", "write", "mark_read"}
+        ]
+
+    def test_a_finished_book_is_marked_read_after_its_days_with_the_read_spanning_them(self):
+        self.book["is_finished"] = True
+        body = self.do_import(self.all_keys()).get_json()
+
+        # Entries only land under the read in progress: any on a read book
+        # would start a second read.
+        self.assertEqual([
+            ("start_reading", AUDIO.book_id, A.date_cls(2026, 1, 5)),
+            ("ensure_status", AUDIO.book_id, "currently-reading"),
+            ("write", "2026-01-05", 10.0), ("write", "2026-01-06", 20.0), ("write", "2026-01-07", 30.0),
+            ("mark_read", AUDIO.book_id, A.date_cls(2026, 1, 5), A.date_cls(2026, 1, 7)),
+            ("ensure_status", AUDIO.book_id, "read"),
+        ], self.storygraph_calls())
+        self.assertEqual("marked_read", body["finish"])
+
+    def test_abs_start_and_finish_dates_widen_the_read(self):
+        day = 24 * 60 * 60 * 1000
+        jan_5 = 1767571200000  # 2026-01-05T00:00:00Z
+        self.book.update(is_finished=True, started_at=jan_5 - 2 * day, finished_at=jan_5 + 5 * day)
+        self.do_import(self.all_keys())
+
+        mark = next(c for c in self.storygraph_calls() if c[0] == "mark_read")
+        self.assertEqual((A.date_cls(2026, 1, 3), A.date_cls(2026, 1, 10)), mark[2:])
+
+    def test_only_the_imported_days_date_the_read(self):
+        # A relistened book's history also holds its first listen.
+        self.book["is_finished"] = True
+        self.do_import(self.all_keys()[1:])
+
+        calls = {c[0]: c for c in self.storygraph_calls()}
+        self.assertEqual(A.date_cls(2026, 1, 6), calls["start_reading"][2])
+        self.assertEqual((A.date_cls(2026, 1, 6), A.date_cls(2026, 1, 7)), calls["mark_read"][2:])
+
+    def test_a_failed_day_leaves_a_finished_book_currently_reading_for_the_retry(self):
+        self.book["is_finished"] = True
+        FakeStoryGraph.write_result = {"2026-01-06": False}
+        body = self.do_import(self.all_keys()).get_json()
+
+        self.assertNotIn("mark_read", [c[0] for c in self.storygraph_calls()])
+        self.assertEqual("left_currently_reading", body["finish"])
+
+    def test_an_unfinished_book_is_not_marked_read(self):
+        body = self.do_import(self.all_keys()).get_json()
+
+        # The start is dated to the first listening day, not today.
+        self.assertEqual(
+            [
+                ("start_reading", AUDIO.book_id, A.date_cls(2026, 1, 5)),
+                ("ensure_status", AUDIO.book_id, "currently-reading"),
+            ],
+            [c for c in self.storygraph_calls() if c[0] != "write"],
+        )
+        self.assertIsNone(body["finish"])
+
+    def test_a_book_already_read_on_storygraph_asks_before_importing_as_a_reread(self):
+        FakeStoryGraph.shelf_label = "read"
+        keys = self.all_keys()
+
+        response = self.do_import(keys)
+        self.assertEqual(409, response.status_code)
+        self.assertTrue(response.get_json()["already_read"])
+        self.assertEqual([], self.storygraph_calls())
+
+        body = self.client.post(f"/api/history-import/{self.ITEM}", json={"days": keys, "allow_reread": True}).get_json()
+        self.assertEqual(3, body["imported"])
+
     def test_a_rerun_skips_everything_it_already_imported(self):
         keys = self.all_keys()
         self.do_import(keys)
@@ -497,6 +580,24 @@ class EditionConfirmationTests(_ImportRouteCase):
         results = A.do_sync(user_id, [finished_book], label="jordan", start_before_finish={self.ITEM})
         self.assertEqual(["success"], [result["status"] for result in results])
         self.assertEqual(["currently-reading", "read"], statuses)
+
+
+    def test_a_finish_dates_its_read_from_abs_in_the_users_timezone(self):
+        user_id = self.user["id"]
+        self.confirm()
+        A.set_cfg(user_id, {"TIMEZONE": "Pacific/Auckland"})
+        # 2026-01-05 13:00 and 2026-01-09 12:00 UTC are the next day in Auckland.
+        finished_book = dict(
+            self.book, progress_percent=100.0, current_minutes=600.0, is_finished=True,
+            started_at=1767618000000, finished_at=1767960000000,
+        )
+        marked = []
+        fake = FakeStoryGraph()
+        fake.mark_read = lambda book_id, started=None, finished=None: marked.append((started, finished)) or (True, False, None)
+        A.StoryGraphClient = lambda *a, **k: fake
+
+        A.do_sync(user_id, [finished_book], label="jordan")
+        self.assertEqual([(A.date_cls(2026, 1, 6), A.date_cls(2026, 1, 10))], marked)
 
 
 class EditionsPageTests(_ImportRouteCase):
