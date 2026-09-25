@@ -318,6 +318,23 @@ def _editions(user_id: str) -> dict[str, dict]:
     return _edition_store.get(user_id).setdefault("books", {})
 
 
+def _edition_json(candidate, details: AudiobookDetails | None = None) -> dict:
+    return {
+        "storygraph_book_id": candidate.book_id,
+        "title": candidate.title,
+        "format": candidate.format,
+        "duration_minutes": candidate.duration_minutes,
+        "identifier": candidate.identifier,
+        "narrators": list(candidate.narrators),
+        "publisher": candidate.publisher,
+        "language": candidate.language,
+        "read_by_you": candidate.read_by_you,
+        # Against this ABS book's narrator, publisher and language, so a
+        # person choosing between candidates can see what agrees.
+        "checks": edition_checks(candidate, details),
+    }
+
+
 def _bare_edition_json(storygraph_book_id: str, title: str | None = None) -> dict:
     """An edition known only by its id (and maybe its page title): a pasted
     URL, an ABS tag, or one sync wrote to before editions were confirmed."""
@@ -1960,23 +1977,6 @@ def _resolve_abs_book(user_id: str, item_id: str) -> dict | None:
         return book
     progress_resp = _abs_get(user_id, f"/api/me/progress/{item_id}", required=False)
     return get_abs_book(user_id, item_id, progress_resp.json() if progress_resp is not None else {})
-
-
-def _edition_json(candidate, details: AudiobookDetails | None = None) -> dict:
-    return {
-        "storygraph_book_id": candidate.book_id,
-        "title": candidate.title,
-        "format": candidate.format,
-        "duration_minutes": candidate.duration_minutes,
-        "identifier": candidate.identifier,
-        "narrators": list(candidate.narrators),
-        "publisher": candidate.publisher,
-        "language": candidate.language,
-        "read_by_you": candidate.read_by_you,
-        # Against this ABS book's narrator, publisher and language, so a
-        # person choosing between candidates can see what agrees.
-        "checks": edition_checks(candidate, details),
-    }
 
 
 def _tagged_edition_title(client: StoryGraphClient, book_id: str) -> str:
