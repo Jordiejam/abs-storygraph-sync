@@ -33,25 +33,6 @@ document.querySelectorAll('[data-scope], [data-mode]').forEach(btn => {
   };
 });
 
-// ── Requests ─────────────────────────────────────────────────────────────
-
-async function getJSON(url) {
-  const d = await (await fetch(url)).json();
-  if (d.error) throw new Error(d.error);
-  return d;
-}
-
-async function sendJSON(url, body, method = 'POST') {
-  const r = await fetch(url, {
-    method,
-    headers: { 'Content-Type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  const d = await r.json().catch(() => ({}));
-  if (!r.ok || d.error) throw new Error(d.error || `Request failed (HTTP ${r.status})`);
-  return d;
-}
-
 // ── Status ────────────────────────────────────────────────────────────────
 
 async function fetchStatus() {
@@ -79,6 +60,7 @@ async function fetchStatus() {
     }
     grid.innerHTML = d.books.map(b => {
       const synced = d.last_synced[b.state_key];
+      const editionState = d.edition_states?.[b.abs_item_id] || 'unchecked';
       const syncedLabel = synced != null
         ? `Last synced at ${synced} min (${b.progress_percent}%)`
         : 'Not yet synced this session';
@@ -100,6 +82,7 @@ async function fetchStatus() {
           <div class="last-sync">${esc(syncedLabel)}</div>
           <div class="book-actions">
             <button class="btn btn-ghost" onclick="openHistory(${jsArg(b.abs_item_id)})">History</button>
+            ${editionState === 'confirmed' ? '' : `<a class="btn btn-ghost" href="/editions?q=${encodeURIComponent(b.title)}">${editionBadge(editionState)} Edition</a>`}
           </div>
         </div>`;
     }).join('');
@@ -172,8 +155,8 @@ function closeHistory() {
   selectedDays = new Set();
 }
 
-// Shown even once an edition is matched: an auto-match can land on the
-// wrong StoryGraph work, so the override must stay reachable.
+// Shown even once an edition is confirmed: a match can land on the wrong
+// StoryGraph work, so correcting it must stay reachable.
 function editionOverrideField(itemId, label) {
   return `
     <div class="field" style="margin-top:1rem">
@@ -182,18 +165,19 @@ function editionOverrideField(itemId, label) {
         <input type="text" id="manual-edition-url" placeholder="https://app.thestorygraph.com/books/...">
         <button class="btn btn-ghost" onclick="submitManualEdition(${jsArg(itemId)})">Use this</button>
       </div>
-      <span class="hint">Pins this book to that edition for both Sync and Import History — useful when a title search lands on the wrong StoryGraph work (e.g. a split-up dramatized adaptation).</span>
+      <span class="hint">Confirms that edition for both Sync and Import History — useful when a title search lands on the wrong StoryGraph work (e.g. a split-up dramatized adaptation).</span>
     </div>`;
 }
 
-// Nothing is importable until StoryGraph has an edition to attach entries to.
+// Nothing is importable until a person has confirmed which StoryGraph edition
+// the entries attach to.
 function importableDays(data) {
-  if (!data.matched_edition) return [];
+  if (data.edition_state !== 'confirmed') return [];
   return (data.days || []).filter(d => d.progress_percent != null && !d.already_imported && !d.already_logged_on_storygraph);
 }
 
 async function openHistory(itemId) {
-  const content = showCard('history-card', 'history-content', 'Loading ABS listening sessions and matching a StoryGraph edition…');
+  const content = showCard('history-card', 'history-content', 'Loading ABS listening sessions…');
   try {
     const d = await getJSON(`/api/history-import-preview/${encodeURIComponent(itemId)}`);
     historyView = { itemId, data: d };
@@ -209,30 +193,30 @@ async function openHistory(itemId) {
 
 function editionSection(itemId, data) {
   if (!data.storygraph_ready) {
-    return '<div class="history-note">Add your StoryGraph session in Settings to match an edition and import these days.</div>';
+    return '<div class="history-note">Add a working StoryGraph session in Settings to match an edition and import these days.</div>';
   }
   const edition = data.matched_edition;
-  if (edition) {
-    return `<div class="history-note">Matched edition: <strong>${esc(edition.title || '(untitled)')}</strong>${edition.format ? ` · ${esc(edition.format)}` : ''}${edition.duration_minutes ? ` · ${edition.duration_minutes} min` : ''} — <a href="https://app.thestorygraph.com/books/${encodeURIComponent(edition.storygraph_book_id)}" target="_blank" rel="noopener">verify on StoryGraph ↗</a></div>`;
+  const pick = id => `postEditionChoice(${jsArg(itemId)}, ${jsArg(id)})`;
+  const others = (data.candidates || []).filter(c => c.storygraph_book_id !== edition?.storygraph_book_id);
+  if (data.edition_state === 'confirmed') {
+    return `<div class="history-note">${editionBadge('confirmed')} Edition: <strong>${editionTitleLink(edition)}</strong> ${editionDetails(edition, data.book)}</div>`;
   }
-  const candidateRows = (data.candidates || []).map(c => `
-    <div class="edition-candidate">
-      <div>
-        <strong>${esc(c.title)}</strong><br>
-        <span class="text-dim">${esc(c.format || '')}${c.duration_minutes ? ` · ${c.duration_minutes} min` : ''}${c.identifier ? ` · ${esc(c.identifier)}` : ''}</span>
-      </div>
-      <button class="btn btn-ghost" onclick="postEditionChoice(${jsArg(itemId)}, ${jsArg(c.storygraph_book_id)})">Use this edition</button>
-    </div>`).join('');
+  const lead = data.edition_state === 'suggested'
+    ? `<div class="history-note">${editionBadge('suggested')} Suggested edition: <strong>${editionTitleLink(edition, edition.read_by_you ? READ_EDITION_FALLBACK : 'the edition earlier syncs used')}</strong> ${editionDetails(edition, data.book)}
+         <button class="btn btn-primary" style="margin-left:0.5rem" onclick="${pick(edition.storygraph_book_id)}">Confirm</button>
+         ${matchReasonText(data.match_reason)}${readEditionNote(data.match_reason, pick)}</div>
+       <div class="history-note">Nothing can be imported until you confirm which StoryGraph edition this is.</div>`
+    : `<div class="history-note">Couldn't confidently match a StoryGraph audio edition — nothing can be imported until you pick one.${matchReasonText(data.match_reason)}${readEditionNote(data.match_reason, pick)}</div>`;
   return `
-    <div class="history-note">Couldn't confidently match a StoryGraph audio edition for this book — nothing can be imported until one is selected. StoryGraph sometimes splits dramatized adaptations into separate "1 of 2" / "2 of 2" listings, which this can't guess between safely.</div>
-    ${candidateRows ? `<div class="edition-candidates">${candidateRows}</div>` : '<div class="history-note" style="margin-top:0.75rem">No audio editions turned up in the search either.</div>'}
+    ${lead}
+    ${others.length ? `<div class="edition-candidates">${candidateRows(others, data.book, pick)}</div>` : ''}
     ${editionOverrideField(itemId, 'Or paste a StoryGraph book URL or id')}`;
 }
 
 function renderHistory() {
   const { itemId, data } = historyView;
   const content = document.getElementById('history-content');
-  const canImport = Boolean(data.matched_edition);
+  const canImport = data.edition_state === 'confirmed';
   const importable = importableDays(data);
   const importableKeys = new Set(importable.map(d => d.key));
 
@@ -347,10 +331,11 @@ async function submitManualEdition(itemId) {
 
 async function postEditionChoice(itemId, storygraphBookId) {
   const content = document.getElementById('history-content');
-  content.innerHTML = '<div class="empty-state">Checking that edition…</div>';
+  content.innerHTML = '<div class="empty-state">Confirming that edition…</div>';
   try {
-    await sendJSON(`/api/history-import-edition/${encodeURIComponent(itemId)}`, { storygraph_book_id: storygraphBookId });
+    await confirmEdition(itemId, storygraphBookId);
     openHistory(itemId);
+    fetchStatus();
   } catch (e) {
     content.innerHTML = `<div class="empty-state">${esc(e.message || 'Could not use that edition')}</div>`;
   }
@@ -525,31 +510,6 @@ function toggleAuto(btn) {
 function startTimer() {
   clearInterval(timer);
   timer = setInterval(() => { fetchStatus(); fetchLogs(); }, 5000);
-}
-
-// ── Toast ─────────────────────────────────────────────────────────────────
-
-let toastTimer;
-function toast(msg, type = 'ok') {
-  const el = document.getElementById('toast');
-  el.textContent = msg;
-  el.className = `show ${type}`;
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.className = '', 3500);
-}
-
-function esc(s) {
-  return String(s ?? '')
-    .replace(/&/g,'&amp;')
-    .replace(/</g,'&lt;')
-    .replace(/>/g,'&gt;')
-    .replace(/"/g,'&quot;')
-    .replace(/'/g,'&#39;');
-}
-
-// A value as a JS literal inside an HTML attribute, e.g. onclick="f(${jsArg(id)})".
-function jsArg(value) {
-  return esc(JSON.stringify(value));
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────

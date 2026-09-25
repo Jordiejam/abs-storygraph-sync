@@ -21,7 +21,10 @@ from bs4 import BeautifulSoup
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
 from authlib.integrations.flask_client import OAuth
-from matcher import choose_audio_edition, parse_storygraph_editions
+from matcher import (
+    AudiobookDetails, edition_checks, match_audio_edition, merge_editions, normalise_language,
+    parse_filtered_editions, parse_storygraph_editions,
+)
 from history import build_history_preview, day_key
 from journal import parse_journal_page, progress_dates
 
@@ -33,8 +36,13 @@ CONFIG_DIR = f"{DATA_DIR}/config"
 SYNC_STATE_DIR = f"{DATA_DIR}/sync_state"
 IMPORT_STATE_DIR = f"{DATA_DIR}/import_state"
 SCHEDULER_STATE_DIR = f"{DATA_DIR}/scheduler_state"
+EDITIONS_DIR = f"{DATA_DIR}/editions"
 
 STORYGRAPH_BASE = "https://app.thestorygraph.com"
+# Pages of StoryGraph's audio-only edition filter read per lookup. Each is ten
+# editions and about 1.5 MB; the most-shelved releases come first, and later
+# pages of a popular book are mostly user-added duplicates.
+MAX_AUDIO_EDITION_PAGES = 3
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 600))
 SYNC_THRESHOLD = float(os.environ.get("SYNC_THRESHOLD_MINUTES", 5))
 READ_ONLY = os.environ.get("READ_ONLY", "false").lower() in {"1", "true", "yes", "on"}
@@ -229,12 +237,15 @@ _config_store = _UserJsonStore(CONFIG_DIR)
 # The last {progress %, StoryGraph status} successfully pushed per book.
 _sync_store = _UserJsonStore(SYNC_STATE_DIR)
 
-# Per book (keyed by abs_item_id): {"edition": <the resolved StoryGraph
-# edition, auto-matched or manually picked>, "imported_days": {day_key ->
-# {percent, imported_at}}}. Saved immediately after each verified dated write,
-# so a rerun can never double-import a day and a failure partway through still
-# leaves correct partial state on disk.
+# Per book (keyed by abs_item_id): {"imported_days": {day_key -> {percent,
+# imported_at}}}. Saved immediately after each verified dated write, so a rerun
+# can never double-import a day and a failure partway through still leaves
+# correct partial state on disk.
 _import_store = _UserJsonStore(IMPORT_STATE_DIR)
+
+# {"books": {abs_item_id -> edition entry}}: which StoryGraph edition each ABS
+# book belongs to. See _editions().
+_edition_store = _UserJsonStore(EDITIONS_DIR)
 
 # Lifecycle transitions handled by auto-sync and the date of the most recent
 # daily run. Kept separate from _sync_store: that store only describes writes
@@ -270,10 +281,65 @@ def set_cfg(user_id: str, updates: dict):
     _config_store.save(user_id)
 
 
-def _saved_edition(user_id: str, item_id: str) -> dict | None:
-    """The StoryGraph edition History Import has resolved for this ABS item, if
-    any — the shared source of truth for the import routes and regular sync."""
-    return (_import_store.get(user_id).get(item_id) or {}).get("edition")
+# ── Editions ─────────────────────────────────────────────────────────────────
+# An edition entry is {"state", "edition", "candidates", "checked_at"}:
+#   suggested  a lookup found a confident match (or sync used one before
+#              confirmation existed) — nothing is written to it yet
+#   unmatched  a lookup found nothing confident; "candidates" holds the options
+#   confirmed  a person chose or approved "edition" — the only state sync and
+#              History Import will ever write to
+# A book with no entry has never been looked up. Lookups only ever happen when
+# a person asks for one; nothing here searches StoryGraph on its own.
+
+
+def _editions(user_id: str) -> dict[str, dict]:
+    """This user's live {abs_item_id: entry} map. The first call migrates the
+    editions that used to live elsewhere: History Import's saved edition (a
+    manual pick counts as confirmed, an auto-match only as a suggestion) and
+    the ids regular sync was already writing to, which nobody ever confirmed."""
+    store = _edition_store.get(user_id)
+    if "books" in store:
+        return store["books"]
+    with _user_lock(user_id):
+        if "books" in store:
+            return store["books"]
+        books = {}
+        for item_id, synced in _sync_store.get(user_id).items():
+            book_id = (synced or {}).get("storygraph_book_id")
+            # Legacy title-keyed state can't be tied to an ABS item.
+            if book_id and re.fullmatch(r"[A-Za-z0-9_-]{8,128}", item_id):
+                books[item_id] = {
+                    "state": "suggested",
+                    "edition": {"storygraph_book_id": book_id, "title": None, "format": None,
+                                "duration_minutes": None, "identifier": None},
+                    "candidates": [],
+                }
+        import_state = _import_store.get(user_id)
+        for item_id, item_state in import_state.items():
+            edition = (item_state or {}).pop("edition", None)
+            if edition:
+                source = edition.pop("source", "auto")
+                books[item_id] = {
+                    "state": "confirmed" if source == "manual" else "suggested",
+                    "edition": edition,
+                    "candidates": [],
+                }
+        store["books"] = books
+        _edition_store.save(user_id)
+        _import_store.save(user_id)
+        return books
+
+
+def _edition_entry(user_id: str, item_id: str | None) -> dict:
+    return (_editions(user_id).get(item_id) or {}) if item_id else {}
+
+
+def _confirmed_edition_id(user_id: str, item_id: str | None) -> str | None:
+    """The StoryGraph book id a person confirmed for this ABS item, if any."""
+    entry = _edition_entry(user_id, item_id)
+    if entry.get("state") != "confirmed":
+        return None
+    return (entry.get("edition") or {}).get("storygraph_book_id")
 
 # ── ABS ───────────────────────────────────────────────────────────────────────
 
@@ -308,6 +374,10 @@ def _item_to_book(item: dict, progress: dict) -> dict | None:
         "title": title,
         "author": metadata.get("authorName", ""),
         "identifiers": identifiers,
+        # For telling apart editions that share a runtime; see matcher.
+        "narrators": [name.strip() for name in (metadata.get("narratorName") or "").split(",") if name.strip()],
+        "publisher": metadata.get("publisher") or None,
+        "language": metadata.get("language") or None,
         "progress_percent": round((progress.get("progress") or 0) * 100, 1),
         "current_minutes": round((progress.get("currentTime") or 0) / 60, 1),
         "duration_minutes": round((media.get("duration") or 0) / 60, 1),
@@ -328,7 +398,9 @@ def get_abs_progress(user_id: str) -> dict[str, dict]:
 
 
 def get_abs_book(user_id: str, item_id: str, progress: dict) -> dict | None:
-    resp = _abs_get(user_id, f"/api/items/{item_id}", required=False)
+    # Only the expanded item carries media.duration; without it every book
+    # fetched this way would have a zero runtime.
+    resp = _abs_get(user_id, f"/api/items/{item_id}", {"expanded": 1}, required=False)
     return _item_to_book(resp.json(), progress) if resp is not None else None
 
 
@@ -403,32 +475,35 @@ _STATUS_LABELS = {
 }
 
 
-def _match_audio_edition(candidates, title, duration_minutes=0, identifiers=None):
+def _audiobook_details(book: dict) -> AudiobookDetails:
+    return AudiobookDetails(
+        narrators=tuple(book.get("narrators") or ()),
+        publisher=book.get("publisher"),
+        language=book.get("language"),
+    )
+
+
+def _match_audio_edition(candidates, title, duration_minutes=0, identifiers=None, details=None):
     """The single confident audio-edition match from an already-loaded
-    candidate list (full candidate, for display), or None if nothing meets
-    matcher.choose_audio_edition's tolerance."""
-    matched = choose_audio_edition(
+    candidate list (full candidate, for display) or None, with the reason from
+    matcher.match_audio_edition."""
+    matched, reason = match_audio_edition(
         candidates,
         target_duration_minutes=duration_minutes,
         identifiers=identifiers or [],
+        details=details,
     )
     if matched:
-        delta = abs((matched.duration_minutes or duration_minutes) - duration_minutes)
         logger.info(
-            "Matched '%s' to audio edition id=%s (runtime %.1f min, delta %.1f min)",
-            title,
-            matched.book_id,
-            matched.duration_minutes or 0,
-            delta,
+            "Matched '%s' to audio edition id=%s by %s (runtime %.1f min vs ABS %.1f min)",
+            title, matched.book_id, reason["code"], matched.duration_minutes or 0, duration_minutes,
         )
     else:
         logger.warning(
-            "No confident audio edition match for '%s' (ABS runtime %.1f min, %d candidates)",
-            title,
-            duration_minutes,
-            len(candidates),
+            "No confident audio edition match for '%s': %s (ABS runtime %.1f min, %d candidates)",
+            title, reason["code"], duration_minutes, len(candidates),
         )
-    return matched
+    return matched, reason
 
 
 def _input_value(html: str, name: str) -> str | None:
@@ -458,6 +533,10 @@ def _parse_current_progress(html) -> float | None:
         return float(value)
     except ValueError:
         return None
+
+
+class StoryGraphAuthError(Exception):
+    """StoryGraph bounced a request to its sign-in page."""
 
 
 class StoryGraphClient:
@@ -514,10 +593,11 @@ class StoryGraphClient:
             self._authed = "sign_in" not in self._get("/").url
         return self._authed
 
-    def _find_initial_book_id(self, title, author) -> str | None:
+    def _find_initial_book_id(self, query) -> str | None:
         """The top search result's book id, or None (logged) if there isn't one."""
-        query = req.utils.quote(f"{title} {author}".strip())
-        resp = self._get(f"/browse?search_term={query}")
+        resp = self._get(f"/browse?search_term={req.utils.quote(query)}")
+        if "sign_in" in resp.url:
+            raise StoryGraphAuthError("StoryGraph session invalid — update it in Settings")
         m = None
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.text, "html.parser")
@@ -529,33 +609,59 @@ class StoryGraphClient:
             if link:
                 m = re.search(r"/books/([^/?]+)", link.get("href", ""))
         if not m:
-            logger.warning("No StoryGraph result for '%s'", title)
+            logger.warning("No StoryGraph result for '%s'", query)
             return None
         return m.group(1)
 
-    def load_editions(self, title, author) -> list:
-        """Every edition StoryGraph lists for the closest search result to
-        (title, author). Pass the result to _match_audio_edition()."""
-        initial_id = self._find_initial_book_id(title, author)
+    def load_editions(self, query, language: str | None = None) -> list:
+        """The editions of the top search result for `query`: the first page of
+        every format, plus up to MAX_AUDIO_EDITION_PAGES of audio editions
+        only, in `language` when that's known. Pass the result to
+        _match_audio_edition().
+
+        The editions list is paginated and mostly print, so its first page
+        alone can miss audio editions entirely. It's still read, because it
+        carries the edition you've read and the page's current edition, which
+        the filter leaves out."""
+        initial_id = self._find_initial_book_id(query)
         if not initial_id:
             return []
         editions_resp = self._get(f"/books/{initial_id}/editions")
         if editions_resp.status_code != 200:
-            logger.warning("Could not load StoryGraph editions for '%s'", title)
+            logger.warning("Could not load StoryGraph editions for '%s'", query)
             return []
-        return parse_storygraph_editions(editions_resp.text)
+        pages = [parse_storygraph_editions(editions_resp.text)]
+        try:
+            pages.extend(self._audio_editions(initial_id, language))
+        except (req.RequestException, ValueError) as exc:
+            # The plain list still gives a (poorer) answer.
+            logger.warning("StoryGraph audio edition filter failed for '%s': %s", query, exc)
+        return merge_editions(*pages)
 
-    def search_book(self, title, author, duration_minutes=0, identifiers=None) -> str | None:
-        # With nothing to match an edition on (e.g. an ebook in the library
-        # scope), fall back to the top search result.
-        if not duration_minutes and not identifiers:
-            initial_id = self._find_initial_book_id(title, author)
-            if initial_id:
-                logger.info("Found '%s' -> id=%s", title, initial_id)
-            return initial_id
-        editions = self.load_editions(title, author)
-        matched = _match_audio_edition(editions, title, duration_minutes, identifiers)
-        return matched.book_id if matched else None
+    def _audio_editions(self, book_id: str, language: str | None) -> list[list]:
+        """Pages of the editions page's own filter, with only audio ticked.
+        It's an XHR endpoint that answers with jQuery; see
+        matcher.parse_filtered_editions."""
+        params = {"book_id": book_id, "format_audio": "true", "commit": "Filter"}
+        if language:
+            params["languages[]"] = language
+        pages, page = [], 1
+        while page and page <= MAX_AUDIO_EDITION_PAGES:
+            resp = self._session.get(
+                f"{STORYGRAPH_BASE}/filter-editions",
+                params={**params, "page": page},
+                headers={
+                    "Accept": "text/javascript, application/javascript, */*; q=0.01",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": f"{STORYGRAPH_BASE}/books/{book_id}/editions",
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            editions, next_page = parse_filtered_editions(resp.text)
+            pages.append(editions)
+            page = next_page if next_page and next_page > page else None
+        return pages
 
     def get_book_page(self, book_id) -> str:
         return self._get(f"/books/{book_id}").text
@@ -754,15 +860,21 @@ def do_sync(
             state_key = _book_state_key(book)
             prev = _previous_sync(synced, book)
 
-            # A manual pin is a correction, so it outranks the edition an
-            # earlier sync settled on. Dropping prev also defeats the unchanged
-            # check below: the pinned edition has none of the old one's progress.
-            pinned = _pinned_edition_id(user_id, book.get("abs_item_id"))
-            if pinned and prev and prev.get("storygraph_book_id") != pinned:
-                logger.info(
-                    "[%s] '%s': manually pinned edition %s replaces %s",
-                    label, book["title"], pinned, prev.get("storygraph_book_id"),
-                )
+            # Only a confirmed edition is ever written to. Confirming a
+            # different one than an earlier sync used is a correction, so prev
+            # is dropped, which also defeats the unchanged check below: the new
+            # edition has none of the old one's progress.
+            book_id = _confirmed_edition_id(user_id, book.get("abs_item_id"))
+            if not book_id:
+                logger.info("[%s] '%s' has no confirmed StoryGraph edition — skipping", label, book["title"])
+                results.append(_sync_result(book, "needs_edition"))
+                continue
+            if prev and prev.get("storygraph_book_id") != book_id:
+                if prev.get("storygraph_book_id"):
+                    logger.info(
+                        "[%s] '%s': confirmed edition %s replaces %s",
+                        label, book["title"], book_id, prev.get("storygraph_book_id"),
+                    )
                 prev = None
 
             if (
@@ -773,24 +885,6 @@ def do_sync(
             ):
                 logger.info("[%s] '%s' unchanged (%s, %.1f%%) — skipping", label, book["title"], status, pct)
                 results.append(_sync_result(book, "unchanged"))
-                continue
-
-            book_id = prev.get("storygraph_book_id") if prev else None
-            if not book_id and book.get("abs_item_id"):
-                # Reuse an edition History Import already matched, or a person
-                # pinned, before searching.
-                edition = _saved_edition(user_id, book["abs_item_id"])
-                if edition:
-                    book_id = edition.get("storygraph_book_id")
-            if not book_id:
-                book_id = client.search_book(
-                    book["title"],
-                    book["author"],
-                    duration_minutes=book.get("duration_minutes", 0),
-                    identifiers=book.get("identifiers", []),
-                )
-            if not book_id:
-                results.append({"title": book["title"], "status": "not_found", "reason": "no_confident_audio_edition"})
                 continue
 
             # A short book can be first observed after it has already finished.
@@ -1049,7 +1143,6 @@ def _daily_history_sync(
 ) -> bool:
     """Reconcile completed ABS listening days through History Import's path."""
     all_ok = True
-    synced = _sync_store.get(user_id)
     for book in books:
         item_id = book.get("abs_item_id")
         if not item_id or book.get("current_minutes", 0) <= 0:
@@ -1064,12 +1157,11 @@ def _daily_history_sync(
             )
             if not checkpoints:
                 continue
-            sync_state = _previous_sync(synced, book) or {}
-            storygraph_book_id = sync_state.get("storygraph_book_id")
+            storygraph_book_id = _confirmed_edition_id(user_id, item_id)
             if not storygraph_book_id:
-                # Retrying can't conjure an edition, so this must not hold the
-                # whole daily run back for every other book.
-                logger.warning("[%s] Daily history has no matched edition for '%s'; skipping it", label, book["title"])
+                # Retrying can't conjure a confirmation, so this must not hold
+                # the whole daily run back for every other book.
+                logger.warning("[%s] Daily history has no confirmed edition for '%s'; skipping it", label, book["title"])
                 continue
             results = _reconcile_history_checkpoints(
                 user_id,
@@ -1200,9 +1292,9 @@ def _poll_user(user: dict, now: datetime | None = None):
                 client=client,
                 label=label,
             ) if scoped_books else []
-            # Judge each book on its own. A book StoryGraph has no audio
-            # edition for will never match on a retry, so it is skipped rather
-            # than holding back every other book's history and the day itself.
+            # Judge each book on its own. A book without a confirmed edition
+            # won't gain one on a retry, so it is skipped rather than holding
+            # back every other book's history and the day itself.
             # Anything else (auth, network, a rejected write) may clear up, so
             # it keeps the day open for the next poll.
             history_books = []
@@ -1210,9 +1302,9 @@ def _poll_user(user: dict, now: datetime | None = None):
             for book, result in zip(scoped_books, status_results):
                 if result["status"] in {"success", "unchanged"}:
                     history_books.append(book)
-                elif result["status"] == "not_found":
+                elif result["status"] == "needs_edition":
                     logger.warning(
-                        "[%s] Daily sync: no StoryGraph match for '%s'; skipping it",
+                        "[%s] Daily sync: no confirmed StoryGraph edition for '%s'; skipping it",
                         label, book["title"],
                     )
                 else:
@@ -1404,6 +1496,15 @@ def index():
     )
 
 
+@app.route("/editions")
+def editions_page():
+    return render_template(
+        "editions.html",
+        is_admin=bool(g.user.get("is_admin")),
+        display_name=g.user.get("display_name") or g.user.get("username"),
+    )
+
+
 @app.route("/api/status")
 def api_status():
     user_id = g.user["id"]
@@ -1427,6 +1528,10 @@ def api_status():
         "daily_sync_time": cfg(user_id, "DAILY_SYNC_TIME", DEFAULT_DAILY_SYNC_TIME),
         "books": books,
         "last_synced": last,
+        "edition_states": {
+            book["abs_item_id"]: _edition_entry(user_id, book["abs_item_id"]).get("state", "unchecked")
+            for book in books
+        },
     })
 
 
@@ -1464,13 +1569,20 @@ def _resolve_abs_book(user_id: str, item_id: str) -> dict | None:
     return get_abs_book(user_id, item_id, progress_resp.json() if progress_resp is not None else {})
 
 
-def _edition_json(candidate) -> dict:
+def _edition_json(candidate, details: AudiobookDetails | None = None) -> dict:
     return {
         "storygraph_book_id": candidate.book_id,
         "title": candidate.title,
         "format": candidate.format,
         "duration_minutes": candidate.duration_minutes,
         "identifier": candidate.identifier,
+        "narrators": list(candidate.narrators),
+        "publisher": candidate.publisher,
+        "language": candidate.language,
+        "read_by_you": candidate.read_by_you,
+        # Against this ABS book's narrator, publisher and language, so a
+        # person choosing between candidates can see what agrees.
+        "checks": edition_checks(candidate, details),
     }
 
 
@@ -1482,28 +1594,88 @@ def _storygraph_page_title(html: str) -> str | None:
     return re.sub(r"\s*\|\s*The StoryGraph\s*$", "", m.group(1)).strip() or None
 
 
-def _save_edition(user_id: str, item_id: str, edition: dict, source: str):
-    """Pin this ABS item to a StoryGraph edition, for both History Import and
-    regular sync. Kept whole (not just the id) so a later preview can show what
-    was matched without re-fetching the book page.
+def _look_up_edition(user_id: str, client: StoryGraphClient, book: dict, query: str = "") -> dict:
+    """Search StoryGraph for this ABS book and record what came back, as a
+    suggestion or a list of candidates. Never confirms anything, and never
+    unconfirms: a lookup on a confirmed book only refreshes its candidates, so
+    a person can pick a different edition."""
+    search = query or f"{book['title']} {book['author']}".strip()
+    editions = client.load_editions(search, normalise_language(book.get("language")) or None)
+    details = _audiobook_details(book)
+    matched, reason = _match_audio_edition(
+        editions, book["title"],
+        duration_minutes=book.get("duration_minutes", 0),
+        identifiers=book.get("identifiers", []),
+        details=details,
+    )
+    audio = [candidate for candidate in editions if candidate.is_audio]
+    read = next((candidate for candidate in editions if candidate.read_by_you), None)
+    if not matched and read:
+        # Nothing matched as audio, so suggest staying on the StoryGraph entry
+        # you already have. It still needs confirming like any suggestion.
+        matched = read
+        reason["read_edition"]["fallback"] = True
+    offered = _offered_candidates(audio or editions, book, details, keep=(matched, read))
+    with _user_lock(user_id):
+        entry = _editions(user_id).setdefault(book["abs_item_id"], {})
+        entry["candidates"] = [_edition_json(candidate, details) for candidate in offered]
+        entry["checked_at"] = time.time()
+        # Why the last lookup did or didn't find a confident match, in terms
+        # of this book's ABS runtime — shown so a "no match" isn't a mystery.
+        entry["reason"] = {**reason, "query": search, "abs_runtime_minutes": book.get("duration_minutes", 0)}
+        if entry.get("state") != "confirmed":
+            entry["state"] = "suggested" if matched else "unmatched"
+            entry["edition"] = _edition_json(matched, details) if matched else None
+        _edition_store.save(user_id)
+        return dict(entry)
 
-    `source` is "manual" when a person chose the edition, which lets it override
-    an edition an earlier sync already settled on; an "auto" match only fills a
-    gap and never retargets a book that is already syncing somewhere."""
-    state = _import_store.get(user_id)
-    state.setdefault(item_id, {})["edition"] = {**edition, "source": source}
-    _import_store.save(user_id)
+
+MAX_OFFERED_EDITIONS = 12
 
 
-def _pinned_edition_id(user_id: str, item_id: str | None) -> str | None:
-    """The StoryGraph book id a person explicitly chose for this ABS item — the
-    only kind that outranks whatever regular sync last used. An edition saved
-    before this field existed counts as "auto": never silently retarget a book
-    on a guess about how its edition was picked."""
-    if not item_id:
-        return None
-    edition = _saved_edition(user_id, item_id) or {}
-    return edition.get("storygraph_book_id") if edition.get("source") == "manual" else None
+def _offered_candidates(candidates: list, book: dict, details: AudiobookDetails, keep) -> list:
+    """The editions worth offering a person, closest first: matching language,
+    then nearest runtime. A popular book has dozens of near-duplicate audio
+    editions, so only the closest few are kept, plus the suggestion and the
+    edition you've read whatever they are. Without any audio edition (an
+    ebook, or the wrong search hit), every edition is offered rather than none."""
+    target = book.get("duration_minutes") or 0
+
+    def closeness(candidate):
+        wrong_language = edition_checks(candidate, details)["language"] is False
+        runtime = candidate.duration_minutes
+        return (wrong_language, runtime is None, abs(runtime - target) if runtime is not None and target else 0)
+
+    offered = sorted(candidates, key=closeness)[:MAX_OFFERED_EDITIONS]
+    for candidate in keep:
+        if candidate and candidate not in offered:
+            offered.append(candidate)
+    return offered
+
+
+def _edition_row(user_id: str, book: dict, entry: dict) -> dict:
+    """One ABS book and its edition entry, as the Editions page shows it."""
+    synced = _previous_sync(_sync_store.get(user_id), book) or {}
+    return {
+        "abs_item_id": book["abs_item_id"],
+        "title": book["title"],
+        "author": book["author"],
+        "duration_minutes": book["duration_minutes"],
+        "identifiers": book.get("identifiers", []),
+        "narrators": book.get("narrators", []),
+        "publisher": book.get("publisher"),
+        "language": book.get("language"),
+        "progress_percent": book["progress_percent"],
+        "is_finished": book["is_finished"],
+        "state": entry.get("state", "unchecked"),
+        "edition": entry.get("edition"),
+        "candidates": entry.get("candidates", []),
+        "checked_at": entry.get("checked_at"),
+        "reason": entry.get("reason"),
+        # Progress already sent here stays on StoryGraph if a different
+        # edition is confirmed, so the page can warn before that happens.
+        "synced_book_id": synced.get("storygraph_book_id"),
+    }
 
 
 @app.route("/api/history-import-preview/<item_id>")
@@ -1522,28 +1694,20 @@ def api_history_import_preview(item_id):
         preview = build_history_preview(sessions, book["duration_minutes"])
 
         storygraph_ready = bool(cfg(user_id, "STORYGRAPH_SESSION"))
-        matched_edition = _saved_edition(user_id, item_id) if storygraph_ready else None
-        candidates = []
+        entry = {}
         logged_dates = set()
         if storygraph_ready:
             client = _storygraph_client(user_id)
-            if not matched_edition:
-                editions = client.load_editions(book["title"], book["author"])
-                matched = _match_audio_edition(
-                    editions, book["title"],
-                    duration_minutes=book["duration_minutes"],
-                    identifiers=book.get("identifiers", []),
-                )
-                if matched:
-                    matched_edition = _edition_json(matched)
-                    # Persisted so the write route uses exactly this edition,
-                    # even if a later search would land elsewhere.
-                    with _user_lock(user_id):
-                        _save_edition(user_id, item_id, matched_edition, source="auto")
-                else:
-                    candidates = [_edition_json(c) for c in editions if c.is_audio]
-            if matched_edition:
-                logged_dates = client.get_logged_progress_dates(matched_edition["storygraph_book_id"])
+            try:
+                entry = _edition_entry(user_id, item_id)
+                # Opening a book's History is a person asking about it, so an
+                # unchecked book gets its lookup here.
+                if not entry:
+                    entry = _look_up_edition(user_id, client, book)
+                if entry.get("state") == "confirmed":
+                    logged_dates = client.get_logged_progress_dates(entry["edition"]["storygraph_book_id"])
+            except StoryGraphAuthError:
+                storygraph_ready = False
 
         imported_days = (_import_store.get(user_id).get(item_id) or {}).get("imported_days", {})
         days = []
@@ -1562,52 +1726,20 @@ def api_history_import_preview(item_id):
                 "title": book["title"],
                 "author": book["author"],
                 "duration_minutes": book["duration_minutes"],
+                "identifiers": book.get("identifiers", []),
             },
             "storygraph_ready": storygraph_ready,
-            "matched_edition": matched_edition,
-            "candidates": candidates,
+            "edition_state": entry.get("state", "unchecked"),
+            "matched_edition": entry.get("edition"),
+            "candidates": entry.get("candidates", []),
+            "match_reason": entry.get("reason"),
+            "synced_book_id": (_previous_sync(_sync_store.get(user_id), book) or {}).get("storygraph_book_id"),
             "summary": preview["summary"],
             "days": days,
         })
     except req.RequestException as exc:
         logger.warning("History import preview failed for %s: %s", item_id, exc)
         return jsonify({"error": "Could not load listening history from Audiobookshelf"}), 502
-
-
-@app.route("/api/history-import-edition/<item_id>", methods=["POST"])
-@needs_abs_item("STORYGRAPH_SESSION")
-def api_history_import_edition(item_id):
-    """Manual edition override: pin which StoryGraph book id to use for this ABS
-    item, for when auto-matching can't confidently choose one itself. Only ever
-    records a choice — never writes any progress, so it stays available in
-    read-only development mode."""
-    user_id = g.user["id"]
-    data = request.json or {}
-    match = re.search(r"([0-9a-fA-F-]{36})", (data.get("storygraph_book_id") or "").strip())
-    if not match:
-        return jsonify({"error": "That doesn't look like a StoryGraph book id or URL"}), 400
-    storygraph_book_id = match.group(1)
-
-    try:
-        client = _storygraph_client(user_id)
-        html = client.get_book_page(storygraph_book_id)
-        if not html or "/sign_in" in html[:200]:
-            return jsonify({"error": "Could not reach that StoryGraph book"}), 400
-    except req.RequestException as exc:
-        logger.warning("Manual edition lookup failed for %s: %s", storygraph_book_id, exc)
-        return jsonify({"error": "Could not reach StoryGraph"}), 502
-
-    # A book page has the title but not the format or runtime, so those stay
-    # unknown for a hand-picked edition.
-    with _user_lock(user_id):
-        _save_edition(user_id, item_id, {
-            "storygraph_book_id": storygraph_book_id,
-            "title": _storygraph_page_title(html),
-            "format": None,
-            "duration_minutes": None,
-            "identifier": None,
-        }, source="manual")
-    return jsonify({"ok": True, "storygraph_book_id": storygraph_book_id})
 
 
 @app.route("/api/history-import/<item_id>", methods=["POST"])
@@ -1629,10 +1761,9 @@ def api_history_import(item_id):
     if not requested:
         return jsonify({"error": "No days were confirmed for import"}), 400
 
-    edition = _saved_edition(user_id, item_id)
-    storygraph_book_id = (edition or {}).get("storygraph_book_id")
+    storygraph_book_id = _confirmed_edition_id(user_id, item_id)
     if not storygraph_book_id:
-        return jsonify({"error": "No StoryGraph edition has been matched or selected for this book yet"}), 400
+        return jsonify({"error": "Confirm a StoryGraph edition for this book before importing"}), 400
 
     try:
         book = _resolve_abs_book(user_id, item_id)
@@ -1667,6 +1798,93 @@ def api_history_import(item_id):
     imported = sum(1 for r in results if r["status"] == "success")
     logger.info("[%s] History import for %s: %d/%d days written", label, item_id, imported, len(results))
     return jsonify({"imported": imported, "total": len(results), "results": results})
+
+
+@app.route("/api/editions")
+def api_editions():
+    """Every book in the ABS library, whatever the sync scope, with its edition
+    entry. Reads only local state and ABS — never StoryGraph."""
+    user_id = g.user["id"]
+    missing = _missing_cfg(user_id, ABS_KEYS)
+    if missing:
+        return jsonify({"error": f"Missing: {', '.join(missing)}"}), 400
+    try:
+        books = get_abs_books(user_id, "library")
+    except req.RequestException as exc:
+        logger.warning("Editions list could not read ABS: %s", exc)
+        return jsonify({"error": "Could not load your library from Audiobookshelf"}), 502
+    editions = _editions(user_id)
+    return jsonify({
+        "storygraph_ready": bool(cfg(user_id, "STORYGRAPH_SESSION")),
+        "books": [_edition_row(user_id, book, editions.get(book["abs_item_id"]) or {}) for book in books],
+    })
+
+
+@app.route("/api/editions/<item_id>/lookup", methods=["POST"])
+@needs_abs_item(*ABS_KEYS, "STORYGRAPH_SESSION")
+def api_edition_lookup(item_id):
+    """Search StoryGraph for one book, optionally with a person's own search
+    words when the title search lands on the wrong work. Records a suggestion
+    or candidates only, so it stays available in read-only development mode."""
+    user_id = g.user["id"]
+    query = str((request.get_json(silent=True) or {}).get("query") or "").strip()[:200]
+    try:
+        book = _resolve_abs_book(user_id, item_id)
+        if not book:
+            return jsonify({"error": "Audiobook metadata was incomplete"}), 422
+        entry = _look_up_edition(user_id, _storygraph_client(user_id), book, query)
+    except StoryGraphAuthError as exc:
+        return jsonify({"error": str(exc)}), 401
+    except req.RequestException as exc:
+        logger.warning("Edition lookup failed for %s: %s", item_id, exc)
+        return jsonify({"error": "Could not reach StoryGraph or Audiobookshelf"}), 502
+    return jsonify(_edition_row(user_id, book, entry))
+
+
+@app.route("/api/editions/<item_id>/confirm", methods=["POST"])
+@needs_abs_item("STORYGRAPH_SESSION")
+def api_edition_confirm(item_id):
+    """Confirm which StoryGraph edition this ABS book is: the suggestion, one
+    of the candidates, or any pasted book URL or id. Only ever records the
+    choice — never writes any progress."""
+    user_id = g.user["id"]
+    data = request.get_json(silent=True) or {}
+    match = re.search(r"([0-9a-fA-F-]{36})", str(data.get("storygraph_book_id") or "").strip())
+    if not match:
+        return jsonify({"error": "That doesn't look like a StoryGraph book id or URL"}), 400
+    storygraph_book_id = match.group(1)
+
+    entry = _edition_entry(user_id, item_id)
+    known = [entry.get("edition"), *entry.get("candidates", [])]
+    edition = next(
+        (dict(e) for e in known if e and e.get("storygraph_book_id") == storygraph_book_id and e.get("title")),
+        None,
+    )
+    if edition is None:
+        try:
+            html = _storygraph_client(user_id).get_book_page(storygraph_book_id)
+        except req.RequestException as exc:
+            logger.warning("Edition lookup failed for %s: %s", storygraph_book_id, exc)
+            return jsonify({"error": "Could not reach StoryGraph"}), 502
+        if not html or "/sign_in" in html[:200]:
+            return jsonify({"error": "Could not reach that StoryGraph book"}), 400
+        # A book page has the title but not the format or runtime, so those
+        # stay unknown for a pasted edition.
+        edition = {
+            "storygraph_book_id": storygraph_book_id,
+            "title": _storygraph_page_title(html),
+            "format": None,
+            "duration_minutes": None,
+            "identifier": None,
+        }
+
+    with _user_lock(user_id):
+        entry = _editions(user_id).setdefault(item_id, {})
+        entry.update(state="confirmed", edition=edition, confirmed_at=time.time())
+        entry.setdefault("candidates", [])
+        _edition_store.save(user_id)
+    logger.info("[%s] Confirmed StoryGraph edition %s for %s", _user_label(g.user), storygraph_book_id, item_id)
+    return jsonify({"ok": True, "state": "confirmed", "edition": edition})
 
 
 @app.route("/api/logs")

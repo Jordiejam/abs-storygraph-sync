@@ -42,6 +42,7 @@ class SchedulerTests(unittest.TestCase):
         A._sync_store = A._UserJsonStore(f"{self.data_dir}/sync")
         A._import_store = A._UserJsonStore(f"{self.data_dir}/import")
         A._scheduler_store = A._UserJsonStore(f"{self.data_dir}/scheduler")
+        A._edition_store = A._UserJsonStore(f"{self.data_dir}/editions")
         A._status_cache.clear()
         A.set_cfg(self.USER_ID, {
             "ABS_URL": "http://abs",
@@ -243,8 +244,8 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(["item-1"], state["pending_daily_items"])
 
     def use_real_daily_run(self, books, *, status_ok=True):
-        """Run the real do_sync and daily history against a fake StoryGraph
-        that matches every title except 'Obscure Podcast'."""
+        """Run the real do_sync and daily history against a fake StoryGraph,
+        with a confirmed edition for every title except 'Obscure Podcast'."""
         A.do_sync = self.real_sync
         A._daily_history_sync = self.real_daily_history
         snapshot = {
@@ -261,6 +262,14 @@ class SchedulerTests(unittest.TestCase):
             {"date": "2026-09-21", "currentTime": 600, "timeListening": 600},
         ]
         sg = {"searches": [], "writes": [], "journal": {}}
+        A._edition_store.get(self.USER_ID)["books"] = {
+            candidate["abs_item_id"]: {
+                "state": "confirmed",
+                "edition": {"storygraph_book_id": f"sg-{candidate['title']}"},
+            }
+            for candidate in books
+            if candidate["title"] != "Obscure Podcast"
+        }
 
         class FakeStoryGraph:
             def __init__(self, *args):
@@ -269,9 +278,9 @@ class SchedulerTests(unittest.TestCase):
             def check_auth(self):
                 return True
 
-            def search_book(self, title, *args, **kwargs):
-                sg["searches"].append(title)
-                return None if title == "Obscure Podcast" else f"sg-{title}"
+            def load_editions(self, query, language=None):
+                sg["searches"].append(query)
+                return []
 
             def ensure_status(self, book_id, status, html=None):
                 return status_ok, True, ""
@@ -298,8 +307,8 @@ class SchedulerTests(unittest.TestCase):
 
         self.assertEqual([("sg-A Book", "2026-09-21")], sg["writes"])
         self.assertEqual("2026-09-22", A._scheduler_store.get(self.USER_ID)["last_daily_run"])
-        # The day is done, so the second poll must not search StoryGraph again.
-        self.assertEqual(1, sg["searches"].count("Obscure Podcast"))
+        # Sync never searches StoryGraph itself; only a person's lookup does.
+        self.assertEqual([], sg["searches"])
 
     def test_transient_status_failure_retries_the_day(self):
         sg = self.use_real_daily_run([book()], status_ok=False)
@@ -318,18 +327,22 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual("2026-09-21", state["last_daily_run"])
         self.assertEqual([], state["pending_daily_items"])
 
-    def test_daily_history_reads_legacy_title_keyed_sync_state(self):
+    def test_daily_history_only_writes_to_a_confirmed_edition(self):
         sg = self.use_real_daily_run([])
-        A._sync_store.get(self.USER_ID)["A Book"] = {
+        A._sync_store.get(self.USER_ID)["item-1"] = {
             "pct": 10.0,
             "status": "currently-reading",
-            "storygraph_book_id": "sg-legacy",
+            "storygraph_book_id": "sg-unconfirmed",
         }
-        ok = A._daily_history_sync(
-            self.USER_ID, [book()], date(2026, 9, 21), date(2026, 9, 21), A.StoryGraphClient(), "jordan",
-        )
-        self.assertTrue(ok)
-        self.assertEqual([("sg-legacy", "2026-09-21")], sg["writes"])
+        args = (self.USER_ID, [book()], date(2026, 9, 21), date(2026, 9, 21), A.StoryGraphClient(), "jordan")
+        self.assertTrue(A._daily_history_sync(*args))
+        self.assertEqual([], sg["writes"])
+
+        A._edition_store.get(self.USER_ID)["books"]["item-1"] = {
+            "state": "confirmed", "edition": {"storygraph_book_id": "sg-confirmed"},
+        }
+        self.assertTrue(A._daily_history_sync(*args))
+        self.assertEqual([("sg-confirmed", "2026-09-21")], sg["writes"])
 
     def test_frequent_threshold_uses_durable_sync_position(self):
         A._sync_store.get(self.USER_ID)["item-1"] = {

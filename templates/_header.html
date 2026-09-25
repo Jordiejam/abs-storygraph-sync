@@ -1,0 +1,23 @@
+<header>
+  <div class="header-left">
+    <div class="logo">
+      <div class="logo-icon">📚</div>
+      <span class="logo-text">ABS → StoryGraph</span>
+    </div>
+    <nav class="nav">
+      <a href="/" class="{{ 'active' if active == 'sync' }}">Sync</a>
+      <a href="/editions" class="{{ 'active' if active == 'editions' }}">Editions</a>
+    </nav>
+  </div>
+  <div class="header-right">
+    {% if active == 'sync' %}
+    <div class="pills">
+      <div class="pill"><div class="dot" id="d-abs"></div><span>ABS</span></div>
+      <div class="pill"><div class="dot" id="d-sg"></div><span>StoryGraph</span></div>
+      <div class="pill"><div class="dot ok" id="d-poll"></div><span id="l-poll">Auto-sync</span></div>
+    </div>
+    {% endif %}
+    <span class="header-user">{{ display_name }}</span>
+    <a href="/logout" class="sign-out">Sign out</a>
+  </div>
+</header>

@@ -13,7 +13,7 @@ Runs as a lightweight Docker container alongside ABS. No browser automation — 
 - Configurable sync scope: just in-progress books, in-progress + finished, or your entire library
 - Web UI to manage credentials, view logs, and trigger a manual sync
 - Progress is only pushed to StoryGraph when it actually changes (no duplicate journal entries)
-- Matches the closest audiobook edition using ISBN/ASIN when available and the ABS runtime
+- An **Editions** page where you match each book to its StoryGraph edition: tick books to search, check the suggestion (ISBN/ASIN match or closest runtime), and confirm it. Sync only ever writes to a confirmed edition
 - Daily history reconstructed from Audiobookshelf playback sessions, shown day by day for review before an opt-in History Import that backdates StoryGraph journal entries
 - Accounts, settings, and sync state persist across restarts
 
@@ -124,14 +124,34 @@ Each user can choose:
 
 The app still checks Audiobookshelf every `POLL_INTERVAL` seconds in Daily mode, but only contacts StoryGraph when a book starts, a book finishes, the daily run is due, or the user selects **Sync Now**. At midnight, it reconciles the previous day's ABS checkpoint using the same duplicate-safe, verified write path as History Import, so the entry keeps the day the listening happened. After downtime it catches up missed completed days; the first daily run only considers yesterday and never sweeps older history automatically. Finished books are retained until that final listening day has been checked. The first check after enabling this version quietly records existing books so old starts and finishes are not replayed.
 
+## Editions
+
+Sync and History Import only write to a StoryGraph edition you have confirmed, so
+nothing lands on the wrong edition by guesswork. The **Editions** page lists your
+whole ABS library, whatever your sync scope:
+
+- Tick books and select **Search selected**. They are looked up one at a time, and
+  only when you ask. Sync itself never searches StoryGraph.
+- Lookups read StoryGraph's audio-only edition list (up to three pages, in the
+  book's language when ABS knows it) as well as the first page of all editions.
+- A confident match (exact ISBN/ASIN, or a runtime within a conservative tolerance)
+  appears as a **suggestion** to confirm, with the reason it matched. When several
+  editions qualify, the one you've already read on StoryGraph comes first, then
+  the ABS narrator and publisher. Otherwise you can choose from the audio editions
+  found, search again with your own words, or paste a StoryGraph book URL.
+- A book without a confirmed edition is skipped by sync and reported as
+  "needs edition". It syncs normally once you confirm one.
+
+Upgrading from an earlier version: editions picked by hand in History Import stay
+confirmed. Editions that sync or History Import chose automatically show up as
+suggestions and need one click to confirm before sync writes to them again.
+
 ## How it works
 
 1. Every `POLL_INTERVAL` seconds, fetches one lightweight ABS progress snapshot per user
 2. Starts and finishes sync promptly; frequent mode pushes changed progress, while daily mode reconciles completed listening days from ABS history
-3. For each book to sync, searches StoryGraph by title/author, inspects that work's editions, and selects an audio edition by exact ISBN/ASIN or closest runtime
+3. Each book is written to the StoryGraph edition confirmed for it on the **Editions** page (stored against the stable Audiobookshelf item ID); books without one are skipped
 4. Progress/status is only pushed if it actually changed since the last successful sync, preventing duplicate reading journal entries
-
-If no audio edition is within a conservative runtime tolerance, the sync leaves the book untouched rather than risk writing progress to the wrong edition. Successful edition choices are persisted against the stable Audiobookshelf item ID and reused on later syncs.
 
 StoryGraph has no public API — this tool uses session cookies to make the same requests the website does.
 

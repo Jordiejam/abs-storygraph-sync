@@ -24,7 +24,26 @@ header {
   letter-spacing: -0.02em;
 }
 
+.header-left { display: flex; align-items: center; gap: 1.5rem; }
 .header-right { display: flex; align-items: center; gap: 0.75rem; }
+
+@media (max-width: 640px) {
+  header { padding: 0 1rem; }
+  .header-left { gap: 0.75rem; }
+  .logo-text, .pills, .header-user { display: none; }
+  main { padding: 1rem; }
+}
+
+.nav { display: flex; gap: 0.25rem; }
+.nav a {
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  text-decoration: none;
+  padding: 0.3rem 0.7rem;
+  border-radius: 6px;
+}
+.nav a:hover { color: var(--text); }
+.nav a.active { color: var(--text); background: var(--surface2); }
 .header-user { font-size: 0.75rem; color: var(--text-dim); }
 .sign-out {
   font-size: 0.75rem;
@@ -228,6 +247,7 @@ h2 {
 }
 .tag-ok { color: var(--green); background: rgba(52, 211, 153, 0.1); }
 .tag-warn { color: var(--yellow); background: rgba(251, 191, 36, 0.1); margin-right: 0.3rem; }
+.tag-bad { color: var(--red); background: rgba(248, 113, 113, 0.1); }
 
 .empty-state {
   color: var(--text-muted);
@@ -380,6 +400,7 @@ input.is-set { border-color: #2d4a3e; background: #0f1f1a; }
 .badge.not_found { background: #1a1a0d; color: var(--yellow); }
 .badge.error   { background: #2a0d0d; color: var(--red); }
 .badge.skipped { background: #1a1a0d; color: var(--text-dim); }
+.badge.needs_edition { background: #1a1a0d; color: var(--yellow); }
 
 .result-title { font-weight: 500; flex: 1; }
 .result-pct   { color: var(--text-dim); font-size: 0.72rem; }
@@ -395,6 +416,66 @@ input.is-set { border-color: #2d4a3e; background: #0f1f1a; }
   background: var(--surface2);
   border: 1px solid var(--border);
   border-radius: 8px;
+}
+
+/* ── Editions page ── */
+a { color: var(--accent2); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.editions-intro { margin: -0.5rem 0 1rem; line-height: 1.5; }
+.editions-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 1rem;
+}
+.editions-toolbar input { max-width: 280px; padding-right: 0.875rem; }
+.filter-group { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+.filter-group .count { color: var(--text-muted); font-size: 0.72rem; }
+
+.edition-row-wrap { border-bottom: 1px solid var(--border); padding: 0.875rem 0; }
+.edition-row {
+  display: grid;
+  grid-template-columns: 1.5rem minmax(0, 1fr) minmax(0, 1.2fr) 11rem;
+  gap: 1rem;
+  align-items: start;
+}
+.edition-check { padding-top: 0.15rem; }
+.edition-book .book-author { margin-top: 0.2rem; }
+.edition-book .tag { margin-left: 0.3rem; vertical-align: middle; }
+.edition-status { display: flex; gap: 0.6rem; align-items: flex-start; font-size: 0.8rem; min-width: 0; }
+.edition-title { font-weight: 500; margin-bottom: 0.15rem; }
+.check-tags { display: flex; flex-wrap: wrap; gap: 0.3rem; margin-top: 0.3rem; }
+.check-tags .tag { margin-right: 0; }
+.book-extra { font-size: 0.72rem; margin-top: 0.15rem; }
+.tag-read { color: var(--accent2); background: rgba(139, 92, 246, 0.14); }
+.read-note {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-top: 0.5rem;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid rgba(139, 92, 246, 0.35);
+  border-radius: 8px;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  line-height: 1.45;
+}
+@media (max-width: 760px) { .read-note { flex-direction: column; align-items: flex-start; } }
+.match-reason { color: var(--text-dim); font-size: 0.72rem; margin-top: 0.35rem; line-height: 1.45; }
+.edition-warning { color: var(--yellow); font-size: 0.72rem; margin-top: 0.35rem; }
+.edition-actions { display: flex; gap: 0.5rem; align-items: center; justify-content: flex-end; }
+.edition-picker { margin: 0.75rem 0 0 2.5rem; }
+.picker-row { display: flex; gap: 0.5rem; }
+.picker-row input { padding-right: 0.875rem; }
+
+@media (max-width: 760px) {
+  .edition-row { grid-template-columns: 1.5rem minmax(0, 1fr); }
+  .edition-status, .edition-actions { grid-column: 2; justify-content: flex-start; }
+  .edition-picker { margin-left: 0; }
+  .picker-row { flex-direction: column; }
 }
 
 /* ── Toast ── */

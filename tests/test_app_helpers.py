@@ -81,9 +81,97 @@ class HelperTests(unittest.TestCase):
         self.assertEqual([50.0, 10.0], [book["progress_percent"] for book in books])
         self.assertEqual(sorted(responses), sorted(urls))
 
+    def test_a_single_item_fetch_asks_abs_for_its_runtime(self):
+        # ABS leaves media.duration out of an item unless it's expanded.
+        def fake_get(url, params=None, **kwargs):
+            media = {"metadata": {"title": "Book"}}
+            if (params or {}).get("expanded"):
+                media["duration"] = 58252.2
+            return _FakeResponse({"id": "item-1", "media": media})
+
+        with mock.patch.object(A.req, "get", fake_get):
+            book = A.get_abs_book(self.USER_ID, "item-1", {})
+        self.assertEqual(970.9, book["duration_minutes"])
+
+    def test_narrators_publisher_and_language_are_kept_for_edition_matching(self):
+        book = A._item_to_book({"id": "item-1", "media": {"duration": 60, "metadata": {
+            "title": "Book", "narratorName": "Ray Porter, Someone Else",
+            "publisher": "Audible Studios", "language": "English",
+        }}}, {})
+        self.assertEqual(["Ray Porter", "Someone Else"], book["narrators"])
+        self.assertEqual(("Audible Studios", "English"), (book["publisher"], book["language"]))
+
     def test_a_missing_abs_item_is_none_rather_than_an_error(self):
         with mock.patch.object(A.req, "get", lambda url, **kwargs: _FakeResponse({}, 404)):
             self.assertIsNone(A.get_abs_book(self.USER_ID, "gone", {}))
+
+
+
+def _filter_page(book_id, identifier, next_page=None):
+    """A /filter-editions response holding one audio edition card."""
+    card = (
+        f'<div><a href=\\"\\/books\\/{book_id}\\">Book<\\/a><p>10h \\u2022 audio<\\/p>'
+        f'<div>ISBN/UID: {identifier}<\\/div><div>Format: Audio<\\/div><\\/div>'
+    )
+    more = (
+        f"$('#next_link').replaceWith('<a id=\\\"next_link\\\" href=\\\"/filter-editions?page={next_page}\\\">more<\\/a>');"
+        if next_page else ""
+    )
+    return f"$('.panes').append(\"{card}\");{more}"
+
+
+class _Resp:
+    def __init__(self, text, status_code=200, url="https://app.thestorygraph.com/x"):
+        self.text, self.status_code, self.url, self.cookies = text, status_code, url, {}
+
+    def raise_for_status(self):
+        if self.status_code != 200:
+            raise A.req.HTTPError(self.status_code)
+
+
+class StoryGraphEditionPagingTests(unittest.TestCase):
+    WORK = "11111111-0000-0000-0000-000000000000"
+
+    def client(self, filter_pages, fail=False):
+        client = A.StoryGraphClient("session")
+        search = f'<a class="book-title-link" href="/books/{self.WORK}">Book</a>'
+        plain = (
+            f'<div><a href="/books/{"22222222-0000-0000-0000-000000000000"}">Book</a>'
+            "<p>300 pages • hardcover</p><div>ISBN/UID: 978</div><div>Format: Hardcover</div></div>"
+        )
+        client._get = lambda path: _Resp(search if path.startswith("/browse") else plain)
+        self.filter_calls = []
+
+        def filter_get(url, params=None, **kwargs):
+            self.filter_calls.append(params)
+            if fail:
+                return _Resp("", 500)
+            return _Resp(filter_pages[params["page"] - 1])
+        client._session.get = filter_get
+        return client
+
+    def test_reads_audio_filter_pages_until_there_are_no_more(self):
+        client = self.client([
+            _filter_page("a" * 8 + "-0000-0000-0000-000000000000", "A1", next_page=2),
+            _filter_page("b" * 8 + "-0000-0000-0000-000000000000", "B1"),
+        ])
+        editions = client.load_editions("Book Author", "english")
+        self.assertEqual(["978", "A1", "B1"], [edition.identifier for edition in editions])
+        self.assertEqual([1, 2], [params["page"] for params in self.filter_calls])
+        self.assertEqual({"english"}, {params["languages[]"] for params in self.filter_calls})
+
+    def test_stops_at_the_page_cap_and_skips_the_language_filter_when_unknown(self):
+        pages = [
+            _filter_page(f"{n:08d}-0000-0000-0000-000000000000", f"P{n}", next_page=n + 1)
+            for n in range(1, 10)
+        ]
+        self.client(pages).load_editions("Book Author")
+        self.assertEqual(A.MAX_AUDIO_EDITION_PAGES, len(self.filter_calls))
+        self.assertNotIn("languages[]", self.filter_calls[0])
+
+    def test_falls_back_to_the_plain_list_when_the_filter_fails(self):
+        editions = self.client([], fail=True).load_editions("Book Author")
+        self.assertEqual(["978"], [edition.identifier for edition in editions])
 
 
 if __name__ == "__main__":
