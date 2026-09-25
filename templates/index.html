@@ -9,21 +9,8 @@
 </head>
 <body>
 
-<header>
-  <div class="logo">
-    <div class="logo-icon">📚</div>
-    ABS → StoryGraph
-  </div>
-  <div class="header-right">
-    <div class="pills">
-      <div class="pill"><div class="dot" id="d-abs"></div><span>ABS</span></div>
-      <div class="pill"><div class="dot" id="d-sg"></div><span>StoryGraph</span></div>
-      <div class="pill"><div class="dot ok" id="d-poll"></div><span id="l-poll">Auto-sync</span></div>
-    </div>
-    <span class="header-user">{{ display_name }}</span>
-    <a href="/logout" class="sign-out">Sign out</a>
-  </div>
-</header>
+{% set active = 'sync' %}
+{% include '_header.html' %}
 
 <main>
 
@@ -155,6 +142,7 @@
 
 <div id="toast"></div>
 
+<script src="{{ asset_url('common.js') }}"></script>
 <script src="{{ asset_url('app.js') }}"></script>
 </body>
 </html>

@@ -9,8 +9,10 @@ import re
 
 from bs4 import BeautifulSoup
 
+from matcher import STORYGRAPH_ID_PATTERN
 
-_ENTRY_PATH_RE = re.compile(r"/journal_entries/([0-9a-fA-F-]{36})/edit")
+
+_ENTRY_PATH_RE = re.compile(rf"/journal_entries/({STORYGRAPH_ID_PATTERN})/edit")
 _ENTRY_DATE_RE = re.compile(
     r"\b(\d{1,2}) (January|February|March|April|May|June|July|August|September|October|November|December) (\d{4})\b"
 )
@@ -25,6 +27,40 @@ class JournalEntry:
     percent: float | None
 
 
+def _entry_ids(tag) -> list[str]:
+    """The ids of the journal entries inside tag, in page order."""
+    return list(dict.fromkeys(
+        _ENTRY_PATH_RE.search(link["href"]).group(1) for link in tag.find_all("a", href=_ENTRY_PATH_RE)
+    ))
+
+
+def soup(page: str | BeautifulSoup) -> BeautifulSoup:
+    """A journal page, parsed once. Every function here takes either the HTML
+    or this, so a caller reading one page several ways parses it only once."""
+    return page if isinstance(page, BeautifulSoup) else BeautifulSoup(page, "html.parser")
+
+
+def journal_entry_ids(page: str | BeautifulSoup) -> list[str]:
+    """Every entry on a journal page, dated or not."""
+    return _entry_ids(soup(page))
+
+
+def started_entry_ids(page: str | BeautifulSoup) -> list[str]:
+    """The "Started reading" entries on a journal page, dated or not: one per
+    read, begun when the book was set to currently reading."""
+    parsed = soup(page)
+    started = []
+    for entry_id in _entry_ids(parsed):
+        link = parsed.find("a", href=re.compile(re.escape(f"/journal_entries/{entry_id}/edit")))
+        # The whole entry is the largest ancestor that holds no other entry.
+        block = link
+        while block.parent is not None and len(_entry_ids(block.parent)) == 1:
+            block = block.parent
+        if "Started reading" in block.get_text(" ", strip=True):
+            started.append(entry_id)
+    return started
+
+
 def _entry_container(link):
     """Return the ancestor holding one full entry (date row + status/percent row).
 
@@ -33,11 +69,17 @@ def _entry_container(link):
     date-only text before an ancestor's text actually grows to include the
     status/percent content too — that first ancestor whose text differs from
     the date-only row is the full entry.
+
+    An undated entry ("No date") never matches a date on its own, so climbing
+    stops at the first ancestor holding another entry: past that, the date and
+    percent found would be a neighbour's.
     """
     date_row_text = None
     for parent in link.parents:
         if getattr(parent, "name", None) in {"body", "html"}:
             break
+        if len(_entry_ids(parent)) > 1:
+            return None
         text = parent.get_text(" ", strip=True)
         if not _ENTRY_DATE_RE.search(text):
             continue
@@ -70,17 +112,16 @@ def _entry_percent(container) -> float | None:
     return None
 
 
-def parse_journal_page(html: str) -> list[JournalEntry]:
+def parse_journal_page(page: str | BeautifulSoup) -> list[JournalEntry]:
     """Parse logged entries from a StoryGraph ``/journal?book_id=<id>`` page.
 
     Relies on the visible date text and percent readout rather than layout
     classes, since the site's markup changes fairly often (same philosophy as
     matcher.py's edition parsing).
     """
-    soup = BeautifulSoup(html, "html.parser")
     by_id: dict[str, JournalEntry] = {}
 
-    for link in soup.find_all("a", href=True):
+    for link in soup(page).find_all("a", href=True):
         match = _ENTRY_PATH_RE.search(link.get("href", ""))
         if not match:
             continue

@@ -42,6 +42,7 @@ class SchedulerTests(unittest.TestCase):
         A._sync_store = A._UserJsonStore(f"{self.data_dir}/sync")
         A._import_store = A._UserJsonStore(f"{self.data_dir}/import")
         A._scheduler_store = A._UserJsonStore(f"{self.data_dir}/scheduler")
+        A._edition_store = A._UserJsonStore(f"{self.data_dir}/editions")
         A._status_cache.clear()
         A.set_cfg(self.USER_ID, {
             "ABS_URL": "http://abs",
@@ -52,6 +53,10 @@ class SchedulerTests(unittest.TestCase):
             "TIMEZONE": "Europe/London",
         })
         self.user = {"id": self.USER_ID, "username": "jordan"}
+        # Auto-sync only ever looks at books with a confirmed edition.
+        A._edition_store.get(self.USER_ID)["books"] = {
+            "item-1": {"state": "confirmed", "edition": {"storygraph_book_id": "sg-A Book"}},
+        }
 
         self.real_progress = A.get_abs_progress
         self.real_books = A.get_abs_books
@@ -59,6 +64,7 @@ class SchedulerTests(unittest.TestCase):
         self.real_sync = A.do_sync
         self.real_daily_history = A._daily_history_sync
         A._daily_history_sync = lambda *args, **kwargs: True
+        self.real_finish_history = A._finish_daily_history
         self.real_client = A.StoryGraphClient
         self.real_sessions = A.get_abs_listening_sessions
 
@@ -68,6 +74,7 @@ class SchedulerTests(unittest.TestCase):
         A.get_abs_book = self.real_book
         A.do_sync = self.real_sync
         A._daily_history_sync = self.real_daily_history
+        A._finish_daily_history = self.real_finish_history
         A.StoryGraphClient = self.real_client
         A.get_abs_listening_sessions = self.real_sessions
         shutil.rmtree(self.data_dir, ignore_errors=True)
@@ -133,6 +140,7 @@ class SchedulerTests(unittest.TestCase):
         A.get_abs_progress = lambda user_id: snapshot
         A.get_abs_books = lambda *args, **kwargs: []
         A.get_abs_book = lambda user_id, item_id, item_progress: book(finished=True)
+        A._finish_daily_history = lambda *args: True
         starts = []
 
         def fake_sync(user_id, books, start_before_finish=None, **kwargs):
@@ -194,34 +202,64 @@ class SchedulerTests(unittest.TestCase):
             A._daily_history_range({"last_daily_run": "2026-09-18"}, "2026-09-21"),
         )
 
-    def test_finished_book_stays_pending_until_daily_history_succeeds(self):
+    def daily_finish(self):
+        """A book finished since the last poll, on a day whose daily run is done."""
         self.initialized_state(
+            last_daily_run="2026-09-21",
             books={"item-1": {"handled_started_at": 100, "handled_finished_at": None}},
         )
-        snapshot = {"item-1": progress(finished=True, finished_at=200)}
-        A.get_abs_progress = lambda user_id: snapshot
-        A.get_abs_books = lambda *args, **kwargs: []
+        A.get_abs_progress = lambda user_id: {"item-1": progress(finished=True, finished_at=200)}
+        A.get_abs_books = lambda *args, **kwargs: self.fail("no daily run is due")
         A.get_abs_book = lambda user_id, item_id, item_progress: book(finished=True)
-        seen = []
+        order = []
+        A.do_sync = lambda user_id, books, **kwargs: (
+            order.append("sync") or [{"status": "success", "title": candidate["title"]} for candidate in books]
+        )
+        return order
 
-        def fake_sync(user_id, books, start_before_finish=None, **kwargs):
-            return [{"status": "success", "title": candidate["title"]} for candidate in books]
-
-        def fake_history(user_id, books, *args, **kwargs):
-            seen.extend(candidate["abs_item_id"] for candidate in books)
-            return True
-
-        A.do_sync = fake_sync
-        A._daily_history_sync = fake_history
+    def test_a_daily_finish_writes_its_days_through_today_before_it_is_marked_read(self):
+        order = self.daily_finish()
+        A._finish_daily_history = lambda user_id, candidate, client, label, start, end: (
+            order.append(("history", start, end)) or True
+        )
         A._poll_user(self.user, datetime(2026, 9, 21, 12, tzinfo=timezone.utc))
 
-        state = A._scheduler_store.get(self.USER_ID)
+        self.assertEqual([("history", date(2026, 9, 20), date(2026, 9, 21)), "sync"], order)
+        self.assertEqual(200, A._scheduler_store.get(self.USER_ID)["books"]["item-1"]["handled_finished_at"])
+
+    def test_a_failed_finish_history_holds_the_finish_for_the_next_poll(self):
+        order = self.daily_finish()
+        A._finish_daily_history = lambda *args: order.append("history") and False
+        now = datetime(2026, 9, 21, 12, tzinfo=timezone.utc)
+        A._poll_user(self.user, now)
+        A._poll_user(self.user, now)
+
+        self.assertEqual(["history", "history"], order)
+        self.assertIsNone(A._scheduler_store.get(self.USER_ID)["books"]["item-1"]["handled_finished_at"])
+
+    def test_the_daily_run_leaves_finished_books_out_of_history(self):
+        self.initialized_state(books={
+            "item-1": {"handled_started_at": 100, "handled_finished_at": None},
+            "item-2": {"handled_started_at": 100, "handled_finished_at": 200},
+        })
+        A.get_abs_progress = lambda user_id: {
+            "item-1": progress(),
+            "item-2": {**progress(finished=True, finished_at=200), "libraryItemId": "item-2"},
+        }
+        finished = {**book(finished=True), "abs_item_id": "item-2", "state_key": "item-2", "title": "Done"}
+        A.get_abs_books = lambda *args, **kwargs: [book(), finished]
+        A.do_sync = lambda user_id, books, **kwargs: [{"status": "success", "title": b["title"]} for b in books]
+        seen = []
+        A._daily_history_sync = lambda user_id, books, *args, **kwargs: (
+            seen.extend(candidate["abs_item_id"] for candidate in books) or True
+        )
+        A._poll_user(self.user, datetime(2026, 9, 21, 12, tzinfo=timezone.utc))
+
         self.assertEqual(["item-1"], seen)
-        self.assertEqual([], state["pending_daily_items"])
-        self.assertEqual("2026-09-21", state["last_daily_run"])
+        self.assertEqual("2026-09-21", A._scheduler_store.get(self.USER_ID)["last_daily_run"])
 
     def test_failed_daily_history_is_retried_without_advancing_the_day(self):
-        self.initialized_state(pending_daily_items=["item-1"])
+        self.initialized_state()
         snapshot = {"item-1": progress()}
         A.get_abs_progress = lambda user_id: snapshot
         A.get_abs_books = lambda *args, **kwargs: [book()]
@@ -240,11 +278,10 @@ class SchedulerTests(unittest.TestCase):
         state = A._scheduler_store.get(self.USER_ID)
         self.assertEqual(2, len(calls))
         self.assertNotIn("last_daily_run", state)
-        self.assertEqual(["item-1"], state["pending_daily_items"])
 
     def use_real_daily_run(self, books, *, status_ok=True):
-        """Run the real do_sync and daily history against a fake StoryGraph
-        that matches every title except 'Obscure Podcast'."""
+        """Run the real do_sync and daily history against a fake StoryGraph,
+        with a confirmed edition for every title except 'Obscure Podcast'."""
         A.do_sync = self.real_sync
         A._daily_history_sync = self.real_daily_history
         snapshot = {
@@ -260,7 +297,15 @@ class SchedulerTests(unittest.TestCase):
         A.get_abs_listening_sessions = lambda user_id, item_id: [
             {"date": "2026-09-21", "currentTime": 600, "timeListening": 600},
         ]
-        sg = {"searches": [], "writes": [], "journal": {}}
+        sg = {"searches": [], "writes": [], "journal": {}, "label": "currently reading"}
+        A._edition_store.get(self.USER_ID)["books"] = {
+            candidate["abs_item_id"]: {
+                "state": "confirmed",
+                "edition": {"storygraph_book_id": f"sg-{candidate['title']}"},
+            }
+            for candidate in books
+            if candidate["title"] != "Obscure Podcast"
+        }
 
         class FakeStoryGraph:
             def __init__(self, *args):
@@ -269,12 +314,21 @@ class SchedulerTests(unittest.TestCase):
             def check_auth(self):
                 return True
 
-            def search_book(self, title, *args, **kwargs):
-                sg["searches"].append(title)
-                return None if title == "Obscure Podcast" else f"sg-{title}"
+            def load_editions(self, query, language=None):
+                sg["searches"].append(query)
+                return []
+
+            def get_book_page(self, book_id):
+                return f'<button class="read-status-label">{sg["label"]}</button>'
 
             def ensure_status(self, book_id, status, html=None):
                 return status_ok, True, ""
+
+            def mark_read(self, book_id, started=None, finished=None):
+                return self.ensure_status(book_id, "read")
+
+            def start_reading(self, book_id, started=None):
+                return self.ensure_status(book_id, "currently-reading")
 
             def get_logged_progress_dates(self, book_id):
                 return {date for (logged_id, date) in sg["journal"] if logged_id == book_id}
@@ -298,8 +352,8 @@ class SchedulerTests(unittest.TestCase):
 
         self.assertEqual([("sg-A Book", "2026-09-21")], sg["writes"])
         self.assertEqual("2026-09-22", A._scheduler_store.get(self.USER_ID)["last_daily_run"])
-        # The day is done, so the second poll must not search StoryGraph again.
-        self.assertEqual(1, sg["searches"].count("Obscure Podcast"))
+        # Sync never searches StoryGraph itself; only a person's lookup does.
+        self.assertEqual([], sg["searches"])
 
     def test_transient_status_failure_retries_the_day(self):
         sg = self.use_real_daily_run([book()], status_ok=False)
@@ -308,28 +362,40 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual([], sg["writes"])
         self.assertEqual("2026-09-21", A._scheduler_store.get(self.USER_ID)["last_daily_run"])
 
-    def test_pending_item_removed_from_abs_is_dropped(self):
-        self.initialized_state(pending_daily_items=["gone-item"])
-        A.get_abs_progress = lambda user_id: {}
-        A.get_abs_books = lambda *args, **kwargs: []
-        A._poll_user(self.user, datetime(2026, 9, 21, 12, tzinfo=timezone.utc))
-
-        state = A._scheduler_store.get(self.USER_ID)
-        self.assertEqual("2026-09-21", state["last_daily_run"])
-        self.assertEqual([], state["pending_daily_items"])
-
-    def test_daily_history_reads_legacy_title_keyed_sync_state(self):
+    def test_finish_history_writes_the_last_days_unless_the_book_is_already_read(self):
         sg = self.use_real_daily_run([])
-        A._sync_store.get(self.USER_ID)["A Book"] = {
+        A._edition_store.get(self.USER_ID)["books"] = {
+            "item-1": {"state": "confirmed", "edition": {"storygraph_book_id": "sg-A Book"}},
+        }
+        args = (self.USER_ID, book(finished=True), A.StoryGraphClient(), "jordan", date(2026, 9, 20), date(2026, 9, 21))
+
+        sg["label"] = "read"
+        self.assertTrue(A._finish_daily_history(*args))
+        self.assertEqual([], sg["writes"])
+
+        sg["label"] = "currently reading"
+        self.assertTrue(A._finish_daily_history(*args))
+        self.assertEqual([("sg-A Book", "2026-09-21")], sg["writes"])
+
+    def test_daily_history_only_writes_to_a_confirmed_edition(self):
+        sg = self.use_real_daily_run([])
+        A._sync_store.get(self.USER_ID)["item-1"] = {
             "pct": 10.0,
             "status": "currently-reading",
-            "storygraph_book_id": "sg-legacy",
+            "storygraph_book_id": "sg-unconfirmed",
         }
-        ok = A._daily_history_sync(
-            self.USER_ID, [book()], date(2026, 9, 21), date(2026, 9, 21), A.StoryGraphClient(), "jordan",
-        )
-        self.assertTrue(ok)
-        self.assertEqual([("sg-legacy", "2026-09-21")], sg["writes"])
+        args = (self.USER_ID, [book()], date(2026, 9, 21), date(2026, 9, 21), A.StoryGraphClient(), "jordan")
+        self.assertTrue(A._daily_history_sync(*args))
+        self.assertEqual([], sg["writes"])
+
+        A._edition_store.get(self.USER_ID)["books"]["item-1"] = {
+            "state": "confirmed", "edition": {"storygraph_book_id": "sg-confirmed"},
+        }
+        self.assertTrue(A._daily_history_sync(*args))
+        self.assertEqual([("sg-confirmed", "2026-09-21")], sg["writes"])
+
+    def candidates(self, scope="in_progress_finished", **item_progress):
+        return A._frequent_sync_candidates(self.USER_ID, {"item-1": progress(**item_progress)}, scope)
 
     def test_frequent_threshold_uses_durable_sync_position(self):
         A._sync_store.get(self.USER_ID)["item-1"] = {
@@ -337,8 +403,8 @@ class SchedulerTests(unittest.TestCase):
             "current_minutes": 10.0,
             "status": "currently-reading",
         }
-        self.assertEqual([], A._frequent_sync_candidates(self.USER_ID, [book(current=14.9)]))
-        self.assertEqual(1, len(A._frequent_sync_candidates(self.USER_ID, [book(current=15.0)])))
+        self.assertEqual([], self.candidates(current=14.9 * 60))
+        self.assertEqual(["item-1"], self.candidates(current=15 * 60))
 
     def test_frequent_mode_does_not_recheck_an_already_synced_finish(self):
         A._sync_store.get(self.USER_ID)["item-1"] = {
@@ -346,7 +412,66 @@ class SchedulerTests(unittest.TestCase):
             "current_minutes": 100.0,
             "status": "read",
         }
-        self.assertEqual([], A._frequent_sync_candidates(self.USER_ID, [book(current=100.0, finished=True)]))
+        self.assertEqual([], self.candidates(current=6000, finished=True))
+        del A._sync_store.get(self.USER_ID)["item-1"]
+        self.assertEqual(["item-1"], self.candidates(current=6000, finished=True))
+
+    def test_frequent_candidates_skip_books_without_a_confirmed_edition(self):
+        A._edition_store.get(self.USER_ID)["books"] = {}
+        self.assertEqual([], self.candidates(current=6000))
+
+    def test_the_in_progress_scope_leaves_out_what_abs_does(self):
+        self.assertEqual([], self.candidates("in_progress", current=6000, finished=True))
+        self.assertEqual(["item-1"], self.candidates("in_progress", current=6000))
+
+    def test_a_quiet_frequent_poll_fetches_no_books_and_never_reaches_storygraph(self):
+        A.set_cfg(self.USER_ID, {"SYNC_MODE": "frequent"})
+        self.initialized_state(books={"item-1": {"handled_started_at": 100, "handled_finished_at": None}})
+        A._sync_store.get(self.USER_ID)["item-1"] = {
+            "pct": 10.0, "current_minutes": 10.0, "status": "currently-reading", "storygraph_book_id": "sg-A Book",
+        }
+        A.get_abs_progress = lambda user_id: {"item-1": progress(current=600)}
+        A.get_abs_books = lambda *args, **kwargs: self.fail("fetched the whole scope")
+        A.get_abs_book = lambda *args: self.fail("fetched a book that hadn't moved")
+        A.do_sync = lambda *args, **kwargs: self.fail("synced with nothing to write")
+        A._poll_user(self.user)
+
+    def test_a_frequent_poll_fetches_only_the_book_that_moved(self):
+        A.set_cfg(self.USER_ID, {"SYNC_MODE": "frequent"})
+        self.initialized_state(books={
+            "item-1": {"handled_started_at": 100, "handled_finished_at": None},
+            "item-2": {"handled_started_at": 100, "handled_finished_at": None},
+        })
+        A._edition_store.get(self.USER_ID)["books"]["item-2"] = {
+            "state": "confirmed", "edition": {"storygraph_book_id": "sg-Other"},
+        }
+        A._sync_store.get(self.USER_ID).update({
+            "item-1": {"pct": 10.0, "current_minutes": 10.0, "status": "currently-reading"},
+            "item-2": {"pct": 10.0, "current_minutes": 10.0, "status": "currently-reading"},
+        })
+        A.get_abs_progress = lambda user_id: {
+            "item-1": progress(current=1200),
+            "item-2": {**progress(current=600), "libraryItemId": "item-2"},
+        }
+        A.get_abs_books = lambda *args, **kwargs: self.fail("fetched the whole scope")
+        fetched = []
+        A.get_abs_book = lambda user_id, item_id, item_progress: fetched.append(item_id) or book(current=20.0)
+        A.do_sync = lambda user_id, books, **kwargs: [{"status": "success", "title": b["title"]} for b in books]
+        A._poll_user(self.user)
+        self.assertEqual(["item-1"], fetched)
+
+    def test_an_unchanged_book_remembers_its_position(self):
+        A._sync_store.get(self.USER_ID)["item-1"] = {
+            "pct": 10.0, "current_minutes": 10.0, "status": "currently-reading", "storygraph_book_id": "sg-A Book",
+        }
+
+        class NoStoryGraph:
+            def check_auth(self):
+                raise AssertionError("checked the session with nothing to write")
+
+        results = A.do_sync(self.USER_ID, [book(current=16.0)], label="jordan", client=NoStoryGraph())
+        self.assertEqual("unchanged", results[0]["status"])
+        self.assertEqual(16.0, A._sync_store.get(self.USER_ID)["item-1"]["current_minutes"])
 
 
 if __name__ == "__main__":

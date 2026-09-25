@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Editions · ABS → StoryGraph</title>
+  <link rel="stylesheet" href="{{ asset_url('theme.css') }}">
+  <link rel="stylesheet" href="{{ asset_url('app.css') }}">
+</head>
+<body>
+
+{% set active = 'editions' %}
+{% include '_header.html' %}
+
+<main>
+  <div class="card">
+    <div class="section-header">
+      <h2>Editions</h2>
+      <div class="book-actions">
+        <button class="btn btn-ghost" id="tag-sync-btn" onclick="syncTags()"
+          title="Confirm books tagged with a StoryGraph edition in Audiobookshelf, and tag confirmed books that aren't">Sync ABS tags</button>
+        <button class="btn btn-primary" id="lookup-btn" onclick="lookUpSelected()" disabled>Search selected</button>
+      </div>
+    </div>
+    <p class="text-dim editions-intro">
+      Sync and History Import only write to an edition you've confirmed here.
+      Tick books and search StoryGraph for them, then check each suggestion and confirm it.
+      Nothing is searched or confirmed without you asking. <strong>Sync ABS tags</strong> confirms books
+      already tagged <code>storygraph:&lt;id&gt;</code> in Audiobookshelf and tags the confirmed ones that aren't.
+    </p>
+    <div class="editions-toolbar">
+      <div class="filter-group" id="filter-group"></div>
+      <input type="text" id="edition-search" placeholder="Filter by title or author" oninput="renderEditions()">
+    </div>
+    <div id="editions-list"><div class="empty-state">Loading your library…</div></div>
+  </div>
+</main>
+
+<div id="toast"></div>
+
+<script src="{{ asset_url('common.js') }}"></script>
+<script src="{{ asset_url('editions.js') }}"></script>
+</body>
+</html>

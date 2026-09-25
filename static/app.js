@@ -1,6 +1,7 @@
 let autoRefresh = true;
 let timer;
-let shownLogs = 0;
+let lastLogSeq = 0;     // the newest log line shown
+let clearedLogSeq = 0;  // lines up to this one were cleared
 let readOnlyMode = false;
 
 // The picked button in each settings toggle row, keyed by its data attribute:
@@ -33,25 +34,6 @@ document.querySelectorAll('[data-scope], [data-mode]').forEach(btn => {
   };
 });
 
-// ── Requests ─────────────────────────────────────────────────────────────
-
-async function getJSON(url) {
-  const d = await (await fetch(url)).json();
-  if (d.error) throw new Error(d.error);
-  return d;
-}
-
-async function sendJSON(url, body, method = 'POST') {
-  const r = await fetch(url, {
-    method,
-    headers: { 'Content-Type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  const d = await r.json().catch(() => ({}));
-  if (!r.ok || d.error) throw new Error(d.error || `Request failed (HTTP ${r.status})`);
-  return d;
-}
-
 // ── Status ────────────────────────────────────────────────────────────────
 
 async function fetchStatus() {
@@ -78,7 +60,8 @@ async function fetchStatus() {
       return;
     }
     grid.innerHTML = d.books.map(b => {
-      const synced = d.last_synced[b.state_key];
+      const synced = d.last_synced[b.abs_item_id];
+      const editionState = d.edition_states?.[b.abs_item_id] || 'unchecked';
       const syncedLabel = synced != null
         ? `Last synced at ${synced} min (${b.progress_percent}%)`
         : 'Not yet synced this session';
@@ -100,6 +83,7 @@ async function fetchStatus() {
           <div class="last-sync">${esc(syncedLabel)}</div>
           <div class="book-actions">
             <button class="btn btn-ghost" onclick="openHistory(${jsArg(b.abs_item_id)})">History</button>
+            ${editionState === 'confirmed' ? '' : `<a class="btn btn-ghost" href="/editions?q=${encodeURIComponent(b.title)}">${editionBadge(editionState)} Edition</a>`}
           </div>
         </div>`;
     }).join('');
@@ -144,7 +128,7 @@ function historySummary(s) {
 
   const callouts = [];
   if (s.skipped_session_count) {
-    callouts.push(`⚠ ${s.skipped_session_count} session${s.skipped_session_count === 1 ? '' : 's'} skipped — Audiobookshelf didn't include a usable date or position, so ${s.skipped_session_count === 1 ? 'it isn\'t' : 'they aren\'t'} counted below.`);
+    callouts.push(`⚠ ${plural(s.skipped_session_count, 'session')} skipped — Audiobookshelf didn't include a usable date or position, so ${s.skipped_session_count === 1 ? 'it isn\'t' : 'they aren\'t'} counted below.`);
   }
   const gap = Math.round((s.total_listening_minutes - (s.latest_position_minutes || 0)) * 10) / 10;
   if (gap > 1) {
@@ -172,28 +156,22 @@ function closeHistory() {
   selectedDays = new Set();
 }
 
-// Shown even once an edition is matched: an auto-match can land on the
-// wrong StoryGraph work, so the override must stay reachable.
+// Shown even once an edition is confirmed: a match can land on the wrong
+// StoryGraph work, so correcting it must stay reachable.
 function editionOverrideField(itemId, label) {
-  return `
-    <div class="field" style="margin-top:1rem">
-      <label>${label}</label>
-      <div class="input-row">
-        <input type="text" id="manual-edition-url" placeholder="https://app.thestorygraph.com/books/...">
-        <button class="btn btn-ghost" onclick="submitManualEdition(${jsArg(itemId)})">Use this</button>
-      </div>
-      <span class="hint">Pins this book to that edition for both Sync and Import History — useful when a title search lands on the wrong StoryGraph work (e.g. a split-up dramatized adaptation).</span>
-    </div>`;
+  return pasteEditionField('postEditionChoice', itemId, 'manual-edition-url', label,
+    'Confirms that edition for both Sync and Import History — useful when a title search lands on the wrong StoryGraph work (e.g. a split-up dramatized adaptation).');
 }
 
-// Nothing is importable until StoryGraph has an edition to attach entries to.
+// Nothing is importable until a person has confirmed which StoryGraph edition
+// the entries attach to.
 function importableDays(data) {
-  if (!data.matched_edition) return [];
+  if (data.edition_state !== 'confirmed') return [];
   return (data.days || []).filter(d => d.progress_percent != null && !d.already_imported && !d.already_logged_on_storygraph);
 }
 
 async function openHistory(itemId) {
-  const content = showCard('history-card', 'history-content', 'Loading ABS listening sessions and matching a StoryGraph edition…');
+  const content = showCard('history-card', 'history-content', 'Loading ABS listening sessions…');
   try {
     const d = await getJSON(`/api/history-import-preview/${encodeURIComponent(itemId)}`);
     historyView = { itemId, data: d };
@@ -209,30 +187,30 @@ async function openHistory(itemId) {
 
 function editionSection(itemId, data) {
   if (!data.storygraph_ready) {
-    return '<div class="history-note">Add your StoryGraph session in Settings to match an edition and import these days.</div>';
+    return '<div class="history-note">Add a working StoryGraph session in Settings to match an edition and import these days.</div>';
   }
   const edition = data.matched_edition;
-  if (edition) {
-    return `<div class="history-note">Matched edition: <strong>${esc(edition.title || '(untitled)')}</strong>${edition.format ? ` · ${esc(edition.format)}` : ''}${edition.duration_minutes ? ` · ${edition.duration_minutes} min` : ''} — <a href="https://app.thestorygraph.com/books/${encodeURIComponent(edition.storygraph_book_id)}" target="_blank" rel="noopener">verify on StoryGraph ↗</a></div>`;
+  const pick = id => `postEditionChoice(${jsArg(itemId)}, ${jsArg(id)})`;
+  const others = otherCandidates(data.candidates, edition);
+  if (data.edition_state === 'confirmed') {
+    return `<div class="history-note">${editionBadge('confirmed')} Edition: <strong>${editionTitleLink(edition, editionFallbackTitle(edition, data.book))}</strong> ${editionDetails(edition, data.book)}</div>`;
   }
-  const candidateRows = (data.candidates || []).map(c => `
-    <div class="edition-candidate">
-      <div>
-        <strong>${esc(c.title)}</strong><br>
-        <span class="text-dim">${esc(c.format || '')}${c.duration_minutes ? ` · ${c.duration_minutes} min` : ''}${c.identifier ? ` · ${esc(c.identifier)}` : ''}</span>
-      </div>
-      <button class="btn btn-ghost" onclick="postEditionChoice(${jsArg(itemId)}, ${jsArg(c.storygraph_book_id)})">Use this edition</button>
-    </div>`).join('');
+  const lead = data.edition_state === 'suggested'
+    ? `<div class="history-note">${editionBadge('suggested')} Suggested edition: <strong>${editionTitleLink(edition, editionFallbackTitle(edition, data.book))}</strong> ${editionDetails(edition, data.book)}
+         <button class="btn btn-primary" style="margin-left:0.5rem" onclick="${pick(edition.storygraph_book_id)}">Confirm</button>
+         ${matchReasonText(data.match_reason)}${readEditionNote(data.match_reason, pick)}</div>
+       <div class="history-note">Nothing can be imported until you confirm which StoryGraph edition this is.</div>`
+    : `<div class="history-note">Couldn't confidently match a StoryGraph audio edition — nothing can be imported until you pick one.${matchReasonText(data.match_reason)}${readEditionNote(data.match_reason, pick)}</div>`;
   return `
-    <div class="history-note">Couldn't confidently match a StoryGraph audio edition for this book — nothing can be imported until one is selected. StoryGraph sometimes splits dramatized adaptations into separate "1 of 2" / "2 of 2" listings, which this can't guess between safely.</div>
-    ${candidateRows ? `<div class="edition-candidates">${candidateRows}</div>` : '<div class="history-note" style="margin-top:0.75rem">No audio editions turned up in the search either.</div>'}
+    ${lead}
+    ${others.length ? `<div class="edition-candidates">${candidateRows(others, data.book, pick)}</div>` : ''}
     ${editionOverrideField(itemId, 'Or paste a StoryGraph book URL or id')}`;
 }
 
 function renderHistory() {
   const { itemId, data } = historyView;
   const content = document.getElementById('history-content');
-  const canImport = Boolean(data.matched_edition);
+  const canImport = data.edition_state === 'confirmed';
   const importable = importableDays(data);
   const importableKeys = new Set(importable.map(d => d.key));
 
@@ -285,7 +263,7 @@ function importControls(itemId, importableCount) {
 }
 
 function confirmLabel(count) {
-  return `Confirm & Import ${count} ${count === 1 ? 'entry' : 'entries'}`;
+  return `Confirm & Import ${plural(count, 'entry', 'entries')}`;
 }
 
 // Patch the button and note in place: a full re-render would drop the
@@ -309,7 +287,7 @@ function setAllDays(on) {
 function importNote(count) {
   if (readOnlyMode) return 'Read-only development mode — importing is disabled.';
   if (!count) return 'Nothing selected — tick the days above to import them.';
-  return `Writing ${count} new dated entr${count === 1 ? 'y' : 'ies'} can't be undone automatically — you'd need to delete them by hand on StoryGraph afterward.`;
+  return `Writing ${plural(count, 'new dated entry', 'new dated entries')} can't be undone automatically — you'd need to delete them by hand on StoryGraph afterward.`;
 }
 
 function resultRow(status, title, detail = '') {
@@ -321,36 +299,62 @@ function resultRow(status, title, detail = '') {
     </div>`;
 }
 
-async function confirmImport() {
+const FINISH_NOTES = {
+  marked_read: 'Marked read on StoryGraph, dated from your Audiobookshelf listening.',
+  left_currently_reading: 'Left as currently reading on StoryGraph because some days failed. Import again to retry them; the book is marked read once they are all in.',
+  failed: 'The days were written, but marking the book read on StoryGraph failed. Import again to retry it.',
+};
+
+async function confirmImport(allowReread = false) {
   const { itemId } = historyView;
   const review = document.getElementById('import-review');
   review.innerHTML = '<div class="empty-state">Writing to StoryGraph…</div>';
   try {
     // Keys only — the server rebuilds each checkpoint's date and percentage
     // from Audiobookshelf before writing anything.
-    const result = await sendJSON(`/api/history-import/${encodeURIComponent(itemId)}`, { days: [...selectedDays] });
+    const result = await sendJSON(`/api/history-import/${encodeURIComponent(itemId)}`, {
+      days: [...selectedDays],
+      allow_reread: allowReread,
+    });
     const rows = (result.results || []).map(res => resultRow(
       res.status,
       res.date,
       res.reason ? `<span class="text-dim">${esc(res.reason.replace(/_/g, ' '))}</span>` : '',
     )).join('');
-    review.innerHTML = `<div class="history-note">Imported ${result.imported} of ${result.total}. Re-open History to see updated status.</div>${rows}`;
+    const finish = FINISH_NOTES[result.finish] ? ` ${FINISH_NOTES[result.finish]}` : '';
+    review.innerHTML = `<div class="history-note">Imported ${result.imported} of ${result.total}.${esc(finish)} Re-open History to see updated status.</div>${rows}`;
   } catch (e) {
+    if (e.data && e.data.already_read) {
+      askReread(review);
+      return;
+    }
     review.innerHTML = `<div class="empty-state">${esc(e.message || 'Import failed')}</div>`;
   }
 }
 
-async function submitManualEdition(itemId) {
-  const input = document.getElementById('manual-edition-url');
-  await postEditionChoice(itemId, input.value.trim());
+function askReread(review) {
+  // StoryGraph files every journal entry on a book it has as read under a
+  // new read, so these days can only go in as a reread.
+  review.innerHTML = `
+    <div class="history-note">
+      This book is already marked read on StoryGraph. Importing these days
+      will add them as a <strong>reread</strong>: a second read of the book
+      alongside the one already there. To keep a single read instead, remove
+      the book from your shelf on StoryGraph and import again.
+    </div>
+    <div style="margin-top:0.75rem">
+      <button class="btn btn-primary" onclick="confirmImport(true)">Import as a reread</button>
+      <button class="btn btn-ghost" style="margin-left:0.5rem" onclick="renderHistory()">Cancel</button>
+    </div>`;
 }
 
 async function postEditionChoice(itemId, storygraphBookId) {
   const content = document.getElementById('history-content');
-  content.innerHTML = '<div class="empty-state">Checking that edition…</div>';
+  content.innerHTML = '<div class="empty-state">Confirming that edition…</div>';
   try {
-    await sendJSON(`/api/history-import-edition/${encodeURIComponent(itemId)}`, { storygraph_book_id: storygraphBookId });
+    await confirmEdition(itemId, storygraphBookId);
     openHistory(itemId);
+    fetchStatus();
   } catch (e) {
     content.innerHTML = `<div class="empty-state">${esc(e.message || 'Could not use that edition')}</div>`;
   }
@@ -495,15 +499,19 @@ async function fetchLogs(force = false) {
   if (!box) return;  // only rendered for admins
   try {
     const d = await getJSON('/api/logs');
-    if (d.logs.length === shownLogs && !force) return;
+    // The buffer drops old lines once full, so its length can stay put while
+    // new lines arrive; the newest line's number can't.
+    const newest = d.logs.at(-1)?.seq || 0;
+    if (newest === lastLogSeq && !force) return;
+    if (newest < lastLogSeq) clearedLogSeq = 0;  // the server restarted and numbers afresh
     const atBottom = box.scrollHeight - box.scrollTop <= box.clientHeight + 40;
-    box.innerHTML = d.logs.map(l => `
+    box.innerHTML = d.logs.filter(l => l.seq > clearedLogSeq).map(l => `
       <div class="log-line">
         <span class="log-time">${esc(l.time)}</span>
         <span class="log-lvl ${esc(l.level)}">${esc(l.level.slice(0,4))}</span>
         <span class="log-msg ${l.level==='ERROR'?'err':''}">${esc(l.msg)}</span>
       </div>`).join('');
-    shownLogs = d.logs.length;
+    lastLogSeq = newest;
     if (atBottom) box.scrollTop = box.scrollHeight;
   } catch (e) {
     console.error('Log refresh failed', e);
@@ -512,7 +520,7 @@ async function fetchLogs(force = false) {
 
 function clearLogs() {
   document.getElementById('log-box').innerHTML = '';
-  shownLogs = 0;
+  clearedLogSeq = lastLogSeq;
 }
 
 function toggleAuto(btn) {
@@ -527,30 +535,17 @@ function startTimer() {
   timer = setInterval(() => { fetchStatus(); fetchLogs(); }, 5000);
 }
 
-// ── Toast ─────────────────────────────────────────────────────────────────
-
-let toastTimer;
-function toast(msg, type = 'ok') {
-  const el = document.getElementById('toast');
-  el.textContent = msg;
-  el.className = `show ${type}`;
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.className = '', 3500);
-}
-
-function esc(s) {
-  return String(s ?? '')
-    .replace(/&/g,'&amp;')
-    .replace(/</g,'&lt;')
-    .replace(/>/g,'&gt;')
-    .replace(/"/g,'&quot;')
-    .replace(/'/g,'&#39;');
-}
-
-// A value as a JS literal inside an HTML attribute, e.g. onclick="f(${jsArg(id)})".
-function jsArg(value) {
-  return esc(JSON.stringify(value));
-}
+// A hidden tab has no one to show a refresh to, and each status refresh can
+// cost Audiobookshelf a request per book.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    clearInterval(timer);
+  } else if (autoRefresh) {
+    fetchStatus();
+    fetchLogs();
+    startTimer();
+  }
+});
 
 // ── Init ──────────────────────────────────────────────────────────────────
 fetchStatus();
