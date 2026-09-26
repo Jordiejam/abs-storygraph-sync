@@ -87,6 +87,14 @@
           </div>
           <span class="hint">Daily mode reconciles completed listening days using History Import's dated, duplicate-safe writes. Starts and finishes still sync within one polling interval.</span>
         </div>
+        <div class="field span2">
+          <label>Auto-confirm Editions</label>
+          <div style="display:flex;gap:0.5rem;flex-wrap:wrap" id="auto-group">
+            <button type="button" class="btn btn-ghost auto-btn" data-auto="on">Strong Matches</button>
+            <button type="button" class="btn btn-ghost auto-btn" data-auto="off">Off</button>
+          </div>
+          <span class="hint">When you start a book, search StoryGraph for it and confirm the edition only on a strong match (the ABS tag, an ISBN/ASIN, or a runtime and narrator nothing else comes close to). The first write waits one sync so you can undo it on the Editions page. Anything weaker stays a suggestion.</span>
+        </div>
         <div class="field" id="daily-time-field" style="display:none">
           <label for="s-daily-time">Daily Sync Time</label>
           <input type="time" id="s-daily-time" value="00:00">

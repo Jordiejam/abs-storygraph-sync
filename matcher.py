@@ -342,6 +342,33 @@ def match_audio_edition(
     return best, reason
 
 
+def is_strong_match(reason: dict | None, checks: dict | None) -> bool:
+    """Whether a suggestion is certain enough to confirm without a person,
+    from match_audio_edition's reason and the suggestion's edition_checks.
+
+    The ABS tag always is, being a person's earlier pick. An ISBN/ASIN match
+    is, unless the narrator or language disagrees with ABS. A runtime match
+    only is when its narrator agrees with ABS and nothing else came close, or
+    what set it apart from the others was the narrator or your having read
+    it: a runtime alone can't tell regional releases of one recording apart.
+    Anything weaker, including the fallback to the edition you've read, waits
+    for a person."""
+    reason, checks = reason or {}, checks or {}
+    code = reason.get("code")
+    if code == "tagged":
+        return True
+    if checks.get("language") is False or checks.get("narrator") is False:
+        return False
+    if code == "identifier":
+        return True
+    if code == "runtime" and checks.get("narrator"):
+        decided_by = set(reason.get("decided_by") or ())
+        return not reason.get("others_within_tolerance") or bool(
+            decided_by & {"read_before", "narrator", "narrator_exact"}
+        )
+    return False
+
+
 def _why_not_chosen(read, best, target_duration_minutes, identifiers, details, tagged_id=None) -> dict:
     """Why the edition you've read isn't the match, as {"problem": code, ...}."""
     if best and best.book_id == tagged_id:
