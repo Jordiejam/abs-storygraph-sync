@@ -56,6 +56,13 @@ class MatcherTests(unittest.TestCase):
         self.assertEqual(892.0, audio.duration_minutes)
         self.assertEqual("B08X18TDFQ", audio.identifier)
 
+    def test_storygraph_placeholders_read_as_missing(self):
+        editions = parse_storygraph_editions(EDITIONS_HTML)
+
+        digital = next(edition for edition in editions if edition.book_id.startswith("9cfd1ec8"))
+        self.assertIsNone(digital.identifier)
+        self.assertIsNone(digital.publisher)
+
     def test_selects_audio_edition_by_runtime(self):
         editions = parse_storygraph_editions(EDITIONS_HTML)
 
@@ -170,6 +177,30 @@ class MatcherTests(unittest.TestCase):
         self.assertEqual(("John Keating",), by_id["e341e9d7"].narrators)
         # And the read-another-edition links say which edition is yours.
         self.assertEqual({"b5de55e5"}, {key for key, edition in by_id.items() if edition.read_by_you})
+
+    def test_currently_reading_another_edition_links_never_borrow_a_cards_details(self):
+        # While one edition is currently reading, every other card links to it.
+        reading = "dfa2466d-bc05-4b1b-8009-24da4e239fd7"
+        html = f"""
+        <div class="page">
+          <div class="card">
+            <p><a href="/books/{reading}">You're currently reading another edition</a></p>
+            <a href="/books/b4f3e1b7-0000-0000-0000-000000000000">Golden Son</a>
+            <p>17h 19m • audio • 2023</p>
+            <div>ISBN/UID: None</div><div>Format: Audio</div>
+          </div>
+          <div class="current">
+            <a href="/books/{reading}">Golden Son</a>
+            <p>19h 3m • audio • 2015</p>
+            <div>ISBN/UID: 9781470380410</div><div>Format: Audio</div>
+          </div>
+        </div>"""
+        by_id = {edition.book_id[:8]: edition for edition in parse_storygraph_editions(html)}
+
+        self.assertEqual({"b4f3e1b7", "dfa2466d"}, set(by_id))
+        self.assertEqual(("Golden Son", 1143.0, "9781470380410"),
+                         (by_id["dfa2466d"].title, by_id["dfa2466d"].duration_minutes, by_id["dfa2466d"].identifier))
+        self.assertFalse(any(edition.read_by_you for edition in by_id.values()))
 
     def test_an_edition_you_have_read_on_a_later_page_is_kept_as_a_bare_id(self):
         read = "99999999-0000-0000-0000-000000000000"
@@ -318,6 +349,11 @@ class MatcherTests(unittest.TestCase):
         match, reason = match_audio_edition([spanish, english], target_duration_minutes=970.9, details=details)
         self.assertIs(english, match)
         self.assertEqual(1, reason["other_language_editions"])
+
+    def test_narrator_names_match_with_or_without_accents(self):
+        details = AudiobookDetails(narrators=("Kay Eluvian", "Jenna Sharpe"))
+        checks = edition_checks(audio("a", 1.0, narrators=("Jenna Sharpe", "Kay Elúvian")), details)
+        self.assertEqual((True, True), (checks["narrator"], checks["narrator_exact"]))
 
     def test_checks_tolerate_loosely_named_publishers_and_say_when_they_cannot_tell(self):
         details = AudiobookDetails(narrators=("ray porter",), publisher="Penguin Audio", language="English")
