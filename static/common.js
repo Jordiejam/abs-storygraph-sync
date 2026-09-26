@@ -83,18 +83,35 @@ function checkTags(edition) {
   const checks = edition.checks || {};
   const tag = (cls, mark, text, title = '') =>
     `<span class="tag ${cls}"${title ? ` title="${esc(title)}"` : ''}>${mark} ${esc(text)}</span>`;
-  const pass = (ok, text) => tag(ok ? 'tag-ok' : 'tag-bad', ok ? '✓' : '✗', text);
+  const pass = (ok, text, title = '') => tag(ok ? 'tag-ok' : 'tag-bad', ok ? '✓' : '✗', text, title);
   const tags = [];
   if (edition.read_by_you) tags.push('<span class="tag tag-read">📖 You\'ve read this</span>');
-  const narrators = `Narrator: ${(edition.narrators || []).join(', ')}`;
+  // A long cast is cut short on the chip; hovering shows all of it.
+  const allNarrators = (edition.narrators || []).join(', ');
+  const shortNarrators = shortNameList(edition.narrators || []);
+  const narrators = `Narrator: ${shortNarrators}`;
+  const fullList = shortNarrators === allNarrators ? '' : allNarrators;
   if (checks.narrator && !checks.narrator_exact) {
-    tags.push(tag('tag-warn', '~', narrators, 'Shares a narrator with Audiobookshelf, but the lists differ'));
+    tags.push(tag('tag-warn', '~', narrators,
+      `Shares a narrator with Audiobookshelf, but the lists differ${fullList ? `: ${fullList}` : ''}`));
   } else if (checks.narrator != null) {
-    tags.push(pass(checks.narrator, narrators));
+    tags.push(pass(checks.narrator, narrators, fullList));
   }
   if (checks.publisher != null) tags.push(pass(checks.publisher, `Publisher: ${edition.publisher}`));
   if (checks.language === false) tags.push(pass(false, edition.language));
   return tags.join('');
+}
+
+// Whole names, up to about `maxChars`, then "+N more". Always at least one name.
+function shortNameList(names, maxChars = 40) {
+  let shown = 0;
+  let length = 0;
+  while (shown < names.length && (!shown || length + 2 + names[shown].length <= maxChars)) {
+    length += (shown ? 2 : 0) + names[shown].length;
+    shown++;
+  }
+  const rest = names.length - shown;
+  return names.slice(0, shown).join(', ') + (rest ? ` +${rest} more` : '');
 }
 
 const READ_EDITION_FALLBACK = 'The edition you\'ve read';

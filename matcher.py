@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 import re
 
 import json
+import unicodedata
 
 from bs4 import BeautifulSoup
 
@@ -50,6 +51,10 @@ class AudiobookDetails:
     language: str | None = None
 
 
+# What StoryGraph prints in a field it has no value for ("ISBN/UID: None").
+_PLACEHOLDERS = {"none", "not specified"}
+
+
 def _field_value(lines: list[str], label: str) -> str | None:
     wanted = label.casefold().rstrip(":")
     for index, line in enumerate(lines):
@@ -57,9 +62,12 @@ def _field_value(lines: list[str], label: str) -> str | None:
         if key.strip().casefold() != wanted:
             continue
         if separator and value.strip():
-            return value.strip()
-        if index + 1 < len(lines):
-            return lines[index + 1].strip() or None
+            value = value.strip()
+        elif index + 1 < len(lines):
+            value = lines[index + 1].strip()
+        else:
+            return None
+        return None if value.casefold() in _PLACEHOLDERS else value or None
     return None
 
 
@@ -121,11 +129,14 @@ def parse_storygraph_editions(html: str) -> list[EditionCandidate]:
         match = _BOOK_PATH_RE.match(link.get("href", ""))
         if not match:
             continue
-        # Once you've read one edition, every other card links to it as "You've
-        # read another edition". That link says which edition is yours, but it
-        # sits inside another book's card, so it describes nothing itself.
-        if "read another edition" in link.get_text(" ", strip=True).casefold():
-            read_ids.append(match.group(1))
+        # Once one edition is on your shelf, every other card links to it with
+        # your status: "You've read another edition", "You're currently
+        # reading another edition". The link sits inside another book's card,
+        # so it describes nothing itself; only a read one says which is yours.
+        status = link.get_text(" ", strip=True).casefold()
+        if status.endswith("another edition"):
+            if "read another edition" in status:
+                read_ids.append(match.group(1))
             continue
         container = _edition_container(link)
         if container is None:
@@ -225,7 +236,10 @@ def _runtime_tolerance(target_duration_minutes: float) -> float:
 
 
 def _normalise_name(value: str | None) -> str:
-    return " ".join(re.sub(r"[^\w\s]", " ", (value or "").casefold()).split())
+    # Accents are dropped: one side often spells a name without them
+    # ("Kay Eluvian" in ABS, "Kay Elúvian" on StoryGraph).
+    plain = "".join(char for char in unicodedata.normalize("NFKD", value or "") if not unicodedata.combining(char))
+    return " ".join(re.sub(r"[^\w\s]", " ", plain.casefold()).split())
 
 
 _PUBLISHER_NOISE = {"ltd", "limited", "inc", "llc", "co", "the", "publishing", "publishers"}
@@ -265,7 +279,7 @@ def edition_checks(candidate: EditionCandidate, details: AudiobookDetails | None
         checks["narrator_exact"] = wanted == listed
 
     ours, theirs = _publisher_words(details.publisher), _publisher_words(candidate.publisher)
-    if ours and theirs and _normalise_name(candidate.publisher) != "not specified":
+    if ours and theirs and _normalise_name(candidate.publisher) not in _PLACEHOLDERS:
         # Imprints are named loosely ("Penguin Audio" / "Penguin Books Ltd"),
         # so one name's words fitting inside the other's counts.
         checks["publisher"] = ours <= theirs or theirs <= ours
