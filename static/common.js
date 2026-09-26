@@ -1,5 +1,4 @@
-// Helpers shared by every page: requests, escaping, the toast, and the
-// edition rendering the Sync page's History panel and the Editions page share.
+// Helpers shared by every page, including the edition rendering both pages use.
 
 // ── Requests ─────────────────────────────────────────────────────────────
 
@@ -77,9 +76,8 @@ function editionDetails(edition, book) {
   return parts.join(' · ') + (tags ? `<div class="check-tags">${tags}</div>` : '');
 }
 
-// ✓/✗ for how an edition's narrator, publisher and language compare with
-// Audiobookshelf's. A check either side can't make (null) shows nothing. A
-// narrator list that shares a name but isn't the same list shows amber.
+// ✓/✗ chips for edition_checks; unknown shows nothing, a shared-but-different
+// narrator list shows amber.
 function checkTags(edition) {
   const checks = edition.checks || {};
   const tag = (cls, mark, text, title = '') =>
@@ -132,18 +130,28 @@ function otherCandidates(candidates, edition) {
   return (candidates || []).filter(c => c.storygraph_book_id !== edition?.storygraph_book_id);
 }
 
-// A field for pasting any StoryGraph book URL or id. Its button calls the
-// global function `pickFn(itemId, pasted)`.
-function pasteEditionField(pickFn, itemId, inputId, label, hint = '') {
+// A labelled text input with a button beside it. `onclickJs(valueJs)` is the
+// button's onclick body, given a JS expression for the input's value.
+function inputButtonField({ inputId, label, button, onclickJs, value = '', placeholder = '', hint = '', margin = '0.75rem' }) {
   return `
-    <div class="field" style="margin-top:0.75rem">
+    <div class="field" style="margin-top:${margin}">
       <label for="${esc(inputId)}">${esc(label)}</label>
       <div class="picker-row">
-        <input type="text" id="${esc(inputId)}" placeholder="https://app.thestorygraph.com/books/...">
-        <button class="btn btn-ghost" onclick="${pickFn}(${jsArg(itemId)}, document.getElementById(${jsArg(inputId)}).value.trim())">Use this</button>
+        <input type="text" id="${esc(inputId)}" value="${esc(value)}" placeholder="${esc(placeholder)}">
+        <button class="btn btn-ghost" onclick="${onclickJs(`document.getElementById(${jsArg(inputId)}).value.trim()`)}">${esc(button)}</button>
       </div>
       ${hint ? `<span class="hint">${esc(hint)}</span>` : ''}
     </div>`;
+}
+
+// A field for pasting any StoryGraph book URL or id. Its button calls the
+// global function `pickFn(itemId, pasted)`.
+function pasteEditionField(pickFn, itemId, inputId, label, hint = '') {
+  return inputButtonField({
+    inputId, label, hint, button: 'Use this',
+    placeholder: 'https://app.thestorygraph.com/books/...',
+    onclickJs: value => `${pickFn}(${jsArg(itemId)}, ${value})`,
+  });
 }
 
 // `pickJs` is the onclick body for this candidate, given its book id.
@@ -162,8 +170,7 @@ function plural(n, word, pluralWord = `${word}s`) {
   return `${n} ${n === 1 ? word : pluralWord}`;
 }
 
-// Why the last lookup did or didn't find a confident match, as a sentence or
-// two. `reason` comes from matcher.match_audio_edition via the lookup route.
+// Why the last lookup did or didn't match; `reason` is matcher.match_audio_edition's.
 function matchReasonText(reason) {
   if (!reason) return '';
   const audio = plural(reason.audio_editions, 'audio edition');
@@ -222,9 +229,8 @@ function matchReasonText(reason) {
   return text ? `<div class="match-reason">${esc(text)}</div>` : '';
 }
 
-// When you've read a different edition from the one suggested: which, why it
-// isn't the suggestion, and a way to use it anyway. `pickJs` is the onclick
-// body for confirming a book id.
+// The edition you've read, when it isn't the suggestion: why not, and a way to
+// use it anyway. `pickJs` is the onclick body for confirming a book id.
 function readEditionNote(reason, pickJs) {
   const read = reason?.read_edition;
   if (!read || read.chosen || read.fallback) return '';
@@ -249,12 +255,15 @@ function readEditionNote(reason, pickJs) {
     </div>`;
 }
 
-// Confirms and says so. The edition stands even when tagging it in
-// Audiobookshelf failed, so that's only a warning.
+// A failed Audiobookshelf tag is only a warning; the confirmation stands.
 async function confirmEdition(itemId, storygraphBookId) {
   const d = await sendJSON(`/api/editions/${encodeURIComponent(itemId)}/confirm`, { storygraph_book_id: storygraphBookId });
   toast(d.tag_error ? `✓ Edition confirmed. ${d.tag_error}.` : '✓ Edition confirmed', d.tag_error ? 'err' : 'ok');
   return d;
+}
+
+function emptyState(text) {
+  return `<div class="empty-state">${esc(text)}</div>`;
 }
 
 // ── Toast ────────────────────────────────────────────────────────────────

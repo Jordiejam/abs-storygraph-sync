@@ -2,9 +2,7 @@ import unittest
 
 from journal import journal_entry_ids, parse_journal_page, progress_dates, started_entry_ids
 
-# A representative excerpt of StoryGraph's /journal?book_id=<id> markup,
-# captured live: one status-only entry ("Started reading") and one
-# percent-bearing entry, matching the real structure of that page.
+# Live /journal?book_id=<id> markup: one "Started reading" entry and one with a percent.
 JOURNAL_HTML = """
 <span class="journal-entry-panes">
   <div class="mb-3 grid grid-cols-4 md:grid-cols-6">
@@ -75,9 +73,7 @@ class JournalParsingTests(unittest.TestCase):
         self.assertEqual(13.0, entry.percent)
 
     def test_an_undated_entry_does_not_borrow_a_neighbours_date(self):
-        # A book marked read without dates gets undated "Started reading" and
-        # "Finished" entries, listed after the dated ones. The page around the
-        # list is what an undated entry climbs into when nothing stops it.
+        # Marking a book read without dates adds undated entries after the dated ones.
         entries_html = JOURNAL_HTML.rstrip()[: -len("</span>")] + UNDATED_ENTRY + "</span>"
         page = f"<main><h2>Reading Journal</h2>{entries_html}</main>"
         entries = {e.entry_id: e for e in parse_journal_page(page)}
@@ -104,9 +100,8 @@ class JournalParsingTests(unittest.TestCase):
 
 class ProgressDatesTests(unittest.TestCase):
     def test_ignores_status_only_entries(self):
-        # The "Started reading" entry on 6 January carries no percent. Counting
-        # it would let ensure_status()'s own status write block the import of
-        # that same day's listening.
+        # 6 January's "Started reading" entry has no percent, so it mustn't
+        # block that day's import.
         self.assertEqual({"2026-01-07"}, progress_dates(parse_journal_page(JOURNAL_HTML)))
 
     def test_is_empty_when_nothing_has_a_percent(self):

@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ABS → StoryGraph — {% block title %}{% endblock %}</title>
+  {% include '_icons.html' %}
   <link rel="stylesheet" href="{{ asset_url('theme.css') }}">
   <style>
     body {
@@ -14,22 +15,12 @@
     }
 
     .card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
       padding: 2.5rem;
       width: 100%;
       max-width: 380px;
     }
 
-    .logo {
-      display: flex;
-      align-items: center;
-      gap: 0.6rem;
-      font-weight: 700;
-      font-size: 1rem;
-      margin-bottom: 0.4rem;
-    }
+    .logo { margin-bottom: 0.4rem; }
 
     .subtitle {
       color: var(--text-dim);
@@ -40,28 +31,14 @@
 
     label {
       display: block;
-      font-size: 0.7rem;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: var(--text-dim);
       margin-bottom: 0.4rem;
     }
 
     input {
-      width: 100%;
-      background: var(--surface2);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      color: var(--text);
       padding: 0.6rem 0.85rem;
       font-size: 0.9rem;
       margin-bottom: 1.1rem;
-      outline: none;
-      transition: border-color 0.15s;
     }
-
-    input:focus { border-color: var(--accent); }
 
     .error {
       background: rgba(248, 113, 113, 0.1);
@@ -93,7 +70,9 @@
 <body>
   <div class="card">
     <div class="logo">
-      <div class="logo-icon">📚</div>
+      <div class="logo-icon">
+        <img src="{{ asset_url('logo.png') }}" alt="">
+      </div>
       ABS → StoryGraph
     </div>
     <p class="subtitle">{% block subtitle %}{% endblock %}</p>

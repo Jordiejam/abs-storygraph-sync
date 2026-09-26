@@ -14,9 +14,8 @@ from bs4 import BeautifulSoup
 # A StoryGraph book or journal-entry id.
 STORYGRAPH_ID_PATTERN = r"[0-9a-fA-F-]{36}"
 _BOOK_PATH_RE = re.compile(rf"^/books/({STORYGRAPH_ID_PATTERN})/?$")
-# A card's runtime sits at the start of its "16h 10m • audio • 2021" line, and
-# a whole number of hours is written "13h" with no minutes. Requiring the
-# bullet keeps stray text (a series number, a tag) from reading as a runtime.
+# The "16h 10m • audio • 2021" line ("13h" for whole hours). Requiring the
+# bullet stops a series number or tag reading as a runtime.
 _DURATION_RE = re.compile(r"(?<![\w#])(?:(\d+)h(?:\s*(\d+)m)?|(\d+)m)(?=\s*•)")
 
 
@@ -72,11 +71,8 @@ def _field_value(lines: list[str], label: str) -> str | None:
 
 
 def _narrators(container, lines: list[str], is_audio: bool) -> tuple[str, ...]:
-    """Contributors credited as narrator. StoryGraph renders each as a name
-    followed by a "(Narrator)" label, but sometimes credits an audio edition's
-    narrator with no role at all ("with John Keating"); on an audio edition
-    such an unlabelled contributor is taken as the narrator. Cards can repeat
-    their credits for each layout, so duplicates are dropped."""
+    """Contributors labelled "(Narrator)", plus, on an audio edition, any
+    credited with no role at all ("with John Keating")."""
     names = [
         lines[index - 1]
         for index, line in enumerate(lines)
@@ -101,10 +97,8 @@ def _duration_minutes(text: str) -> float | None:
 
 
 def _edition_container(link):
-    """Return the smallest ancestor containing one complete edition card, or
-    None if the smallest one holds several cards. That happens for the link to
-    the work at the top of the page, whose nearest ancestor with any card in it
-    is the whole list — its fields would be whichever card came first."""
+    """The smallest ancestor holding one complete edition card, or None when
+    it holds several (the work's own link at the top of the page)."""
     for parent in link.parents:
         if getattr(parent, "name", None) in {"body", "html"}:
             break
@@ -115,12 +109,8 @@ def _edition_container(link):
 
 
 def parse_storygraph_editions(html: str) -> list[EditionCandidate]:
-    """Parse edition cards from a StoryGraph ``/books/<id>/editions`` page.
-
-    StoryGraph renders duplicate desktop/mobile cards, so results are de-duplicated
-    by book UUID. The parser intentionally relies on visible labels rather than a
-    single layout class; the site changes its presentation markup fairly often.
-    """
+    """Edition cards from a ``/books/<id>/editions`` page, one per book id.
+    Reads visible labels rather than layout classes, which change often."""
     soup = BeautifulSoup(html, "html.parser")
     candidates: list[EditionCandidate] = []
     read_ids: list[str] = []
@@ -129,10 +119,8 @@ def parse_storygraph_editions(html: str) -> list[EditionCandidate]:
         match = _BOOK_PATH_RE.match(link.get("href", ""))
         if not match:
             continue
-        # Once one edition is on your shelf, every other card links to it with
-        # your status: "You've read another edition", "You're currently
-        # reading another edition". The link sits inside another book's card,
-        # so it describes nothing itself; only a read one says which is yours.
+        # "You've read another edition" links sit in other cards and point at
+        # the edition on your shelf; they describe no card themselves.
         status = link.get_text(" ", strip=True).casefold()
         if status.endswith("another edition"):
             if "read another edition" in status:
@@ -156,28 +144,21 @@ def parse_storygraph_editions(html: str) -> list[EditionCandidate]:
         ))
 
     if read_ids:
-        # The edition you've read can be on a later page of the list. It's
-        # still worth offering, so it's kept as a bare id with no details;
-        # merging marks its full card as yours if the page has one.
+        # It may be on a later page, so keep it as a bare id; merging marks
+        # its full card if there is one.
         candidates.append(replace(bare_edition(read_ids[0]), read_by_you=True))
     return merge_editions(candidates)
 
 
-# A jQuery call's quoted argument inside the filter response: a JS string
-# literal, escaped the way Rails' escape_javascript does it.
+# A JS string literal in the filter's jQuery response (Rails escape_javascript).
 _JS_STRING_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
 _NEXT_PAGE_RE = re.compile(r"next_link[^>]*?href=\\?\"[^\"\\]*?[?&]page=(\d+)")
 
 
 def parse_filtered_editions(script: str) -> tuple[list[EditionCandidate], int | None]:
-    """Parse one page of StoryGraph's edition filter (``/filter-editions``),
-    and the number of the next page, if there is one.
-
-    The filter answers with jQuery that inserts the edition cards into the
-    page, so the cards are HTML inside JS string literals — twice, one for each
-    branch of an if. Every literal holding a card is decoded and parsed like
-    the editions page; the duplicates collapse by book id as usual.
-    """
+    """One page of the edition filter (``/filter-editions``) and the next
+    page's number, if any. The cards are HTML inside the jQuery response's
+    string literals, twice over (one per branch of an if)."""
     fragments = []
     for literal in _JS_STRING_RE.findall(script):
         if "ISBN/UID" not in literal:
@@ -188,12 +169,13 @@ def parse_filtered_editions(script: str) -> tuple[list[EditionCandidate], int | 
         except ValueError:
             continue
     next_pages = [int(page) for page in _NEXT_PAGE_RE.findall(script)]
-    return parse_storygraph_editions("".join(fragments)), max(next_pages) if next_pages else None
+    # Each branch carries the same cards, so parse each distinct literal once.
+    return parse_storygraph_editions("".join(dict.fromkeys(fragments))), max(next_pages) if next_pages else None
 
 
 def merge_editions(*lists: list[EditionCandidate]) -> list[EditionCandidate]:
-    """One candidate per book id across several parsed pages: the most
-    complete copy, marked as yours if any page said so."""
+    """One candidate per book id: the most complete copy, marked as yours if
+    any page said so."""
     by_id: dict[str, EditionCandidate] = {}
     for candidate in (candidate for editions in lists for candidate in editions):
         previous = by_id.get(candidate.book_id)
@@ -230,22 +212,19 @@ def _wanted_identifiers(identifiers: list[str] | None) -> set[str]:
 
 
 def _runtime_tolerance(target_duration_minutes: float) -> float:
-    """How far an edition's runtime may be from ABS's and still match: 2%,
-    at least three minutes and at most fifteen."""
+    """2% of the runtime, between three and fifteen minutes."""
     return max(3.0, min(15.0, target_duration_minutes * 0.02))
 
 
 def _normalise_name(value: str | None) -> str:
-    # Accents are dropped: one side often spells a name without them
-    # ("Kay Eluvian" in ABS, "Kay Elúvian" on StoryGraph).
+    # Accents dropped: "Kay Eluvian" in ABS is "Kay Elúvian" on StoryGraph.
     plain = "".join(char for char in unicodedata.normalize("NFKD", value or "") if not unicodedata.combining(char))
     return " ".join(re.sub(r"[^\w\s]", " ", plain.casefold()).split())
 
 
 _PUBLISHER_NOISE = {"ltd", "limited", "inc", "llc", "co", "the", "publishing", "publishers"}
 
-# ABS stores whatever the metadata provider gave it, which is sometimes an
-# ISO code rather than the language name StoryGraph shows.
+# ABS sometimes has an ISO code where StoryGraph shows the language name.
 _LANGUAGE_CODES = {
     "en": "english", "eng": "english", "de": "german", "ger": "german", "deu": "german",
     "fr": "french", "fre": "french", "fra": "french", "es": "spanish", "spa": "spanish",
@@ -265,10 +244,9 @@ def _publisher_words(value: str | None) -> set[str]:
 
 
 def edition_checks(candidate: EditionCandidate, details: AudiobookDetails | None) -> dict:
-    """How this edition compares with what ABS knows: True (agrees), False
-    (disagrees) or None (one side doesn't say) for each of narrator,
-    publisher and language. "narrator" means the two share a narrator;
-    "narrator_exact" that they list exactly the same ones."""
+    """True/False/None (unknown) for whether this edition's narrator,
+    publisher and language agree with ABS's. "narrator" means one is shared,
+    "narrator_exact" the same list."""
     details = details or AudiobookDetails()
     checks = {"narrator": None, "narrator_exact": None, "publisher": None, "language": None}
 
@@ -280,8 +258,7 @@ def edition_checks(candidate: EditionCandidate, details: AudiobookDetails | None
 
     ours, theirs = _publisher_words(details.publisher), _publisher_words(candidate.publisher)
     if ours and theirs and _normalise_name(candidate.publisher) not in _PLACEHOLDERS:
-        # Imprints are named loosely ("Penguin Audio" / "Penguin Books Ltd"),
-        # so one name's words fitting inside the other's counts.
+        # Imprints are named loosely ("Penguin Audio" / "Penguin Books Ltd").
         checks["publisher"] = ours <= theirs or theirs <= ours
 
     ours, theirs = normalise_language(details.language), normalise_language(candidate.language)
@@ -295,13 +272,9 @@ def _signals(candidate: EditionCandidate, details: AudiobookDetails | None) -> d
 
 
 def _metadata_score(candidate: EditionCandidate, details: AudiobookDetails | None) -> int:
-    """A tiebreak between editions that already qualify on runtime or id.
-
-    The edition you've already read comes first, so progress stays on the one
-    StoryGraph entry you have. A different narrator means a different
-    recording, though, so the right narrator's edition still beats it. An
-    exact narrator list edges out one that only shares a narrator, since
-    StoryGraph sometimes credits extra contributors on one release."""
+    """Tiebreak between qualifying editions: the one you've read first (to
+    keep progress on one entry), unless another has the right narrator; an
+    exact narrator list edges out a shared one."""
     checks = _signals(candidate, details)
     return (
         (4 if checks["read_before"] else 0)
@@ -319,9 +292,8 @@ def match_audio_edition(
     details: AudiobookDetails | None = None,
     tagged_id: str | None = None,
 ) -> tuple[EditionCandidate | None, dict]:
-    """Choose a confident audiobook edition, and say why it was or wasn't.
-    When you've already read one edition, the reason also says whether that
-    edition is the match and, if it isn't, why not. See _match_audio."""
+    """_match_audio, plus whether (and if not, why not) the edition you've
+    read is the match."""
     best, reason = _match_audio(
         candidates,
         target_duration_minutes=target_duration_minutes,
@@ -343,16 +315,11 @@ def match_audio_edition(
 
 
 def is_strong_match(reason: dict | None, checks: dict | None) -> bool:
-    """Whether a suggestion is certain enough to confirm without a person,
-    from match_audio_edition's reason and the suggestion's edition_checks.
-
-    The ABS tag always is, being a person's earlier pick. An ISBN/ASIN match
-    is, unless the narrator or language disagrees with ABS. A runtime match
-    only is when its narrator agrees with ABS and nothing else came close, or
-    what set it apart from the others was the narrator or your having read
-    it: a runtime alone can't tell regional releases of one recording apart.
-    Anything weaker, including the fallback to the edition you've read, waits
-    for a person."""
+    """Whether a suggestion can be confirmed without a person: the ABS tag;
+    an ISBN/ASIN match whose narrator and language don't disagree; or a
+    runtime match with an agreeing narrator that nothing else came close to,
+    or that the narrator or your earlier read set apart. A runtime alone
+    can't tell regional releases of one recording apart."""
     reason, checks = reason or {}, checks or {}
     code = reason.get("code")
     if code == "tagged":
@@ -402,25 +369,12 @@ def _match_audio(
     details: AudiobookDetails | None = None,
     tagged_id: str | None = None,
 ) -> tuple[EditionCandidate | None, dict]:
-    """Choose a confident audiobook edition, and say why it was or wasn't.
-
-    The edition the ABS book is tagged with (``tagged_id``) wins outright,
-    whatever its format or language: the tag is written when a person confirms
-    an edition, so it's their pick rather than a guess.
-
-    Otherwise an audio edition in a different language from the ABS book is
-    never chosen. Then an exact ISBN/UID/ASIN match wins. Otherwise an edition's
-    runtime must be within 2% of the ABS runtime, with a floor of three minutes
-    and a ceiling of fifteen. Refusing an uncertain match is deliberate: no
-    StoryGraph update is safer than writing progress to the wrong edition.
-
-    Narrator and publisher never make an edition qualify. They only choose
-    between editions that already do, ahead of the closer runtime, since
-    regional releases of one recording often share a runtime to the minute.
-
-    The reason is a dict whose "code" names the rule that decided it, plus the
-    numbers behind it, for showing a person why a book did or didn't match.
-    """
+    """A confident audio edition or None, and a reason dict whose "code"
+    names the deciding rule. The tagged edition (a person's pick) wins
+    outright; otherwise, among editions in ABS's language, an ISBN/ASIN match,
+    then a runtime within _runtime_tolerance. No match beats a wrong one.
+    Narrator and publisher only choose between editions that already qualify,
+    since regional releases often share a runtime to the minute."""
     all_audio = [candidate for candidate in candidates if candidate.is_audio]
     audio = [candidate for candidate in all_audio if edition_checks(candidate, details)["language"] is not False]
     wanted_ids = _wanted_identifiers(identifiers)
@@ -446,8 +400,7 @@ def _match_audio(
         reason["others_within_tolerance"] = len(others)
         best_score = _metadata_score(best, details)
         if others and all(_metadata_score(candidate, details) < best_score for candidate in others):
-            # Only what set the pick apart: a check every rival also passed
-            # didn't decide anything.
+            # Only checks some rival failed decided anything.
             checks = _signals(best, details)
             rivals = [_signals(candidate, details) for candidate in others]
             reason["decided_by"] = [

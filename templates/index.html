@@ -1,19 +1,6 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ABS → StoryGraph</title>
-  <link rel="stylesheet" href="{{ asset_url('theme.css') }}">
-  <link rel="stylesheet" href="{{ asset_url('app.css') }}">
-</head>
-<body>
-
-{% set active = 'sync' %}
-{% include '_header.html' %}
-
-<main>
-
+{% extends "_app_base.html" %}
+{% set active, script = 'sync', 'app.js' %}
+{% block content %}
   <!-- Currently Listening -->
   <div class="card">
     <div class="section-header">
@@ -63,7 +50,7 @@
           <span class="hint">Browser DevTools → Application → Cookies → app.thestorygraph.com → _storygraph_session</span>
         </div>
         <div class="field span2">
-          <label>StoryGraph Remember Token <span style="font-weight:400;text-transform:none;letter-spacing:0">(optional — extends session life)</span></label>
+          <label>StoryGraph Remember Token <span class="label-note">(optional — extends session life)</span></label>
           <div class="input-row">
             <input type="password" id="s-sg-remember" placeholder="••••••••">
             <button type="button" class="eye-btn" onclick="toggle('s-sg-remember',this)">👁</button>
@@ -72,28 +59,28 @@
         </div>
         <div class="field span2">
           <label>Sync Scope</label>
-          <div style="display:flex;gap:0.5rem;flex-wrap:wrap" id="scope-group">
-            <button type="button" class="btn btn-ghost scope-btn" data-scope="in_progress">In Progress</button>
-            <button type="button" class="btn btn-ghost scope-btn" data-scope="in_progress_finished">+ Finished</button>
-            <button type="button" class="btn btn-ghost scope-btn" data-scope="library">Entire Library</button>
+          <div class="button-row">
+            <button type="button" class="btn btn-ghost" data-scope="in_progress">In Progress</button>
+            <button type="button" class="btn btn-ghost" data-scope="in_progress_finished">+ Finished</button>
+            <button type="button" class="btn btn-ghost" data-scope="library">Entire Library</button>
           </div>
           <span class="hint">Which books to push to StoryGraph. "Entire Library" also marks untouched books as to-read.</span>
         </div>
         <div class="field span2">
           <label>Sync Frequency</label>
-          <div style="display:flex;gap:0.5rem;flex-wrap:wrap" id="mode-group">
-            <button type="button" class="btn btn-ghost mode-btn" data-mode="frequent">Frequent</button>
-            <button type="button" class="btn btn-ghost mode-btn" data-mode="daily">Daily</button>
+          <div class="button-row">
+            <button type="button" class="btn btn-ghost" data-mode="frequent">Frequent</button>
+            <button type="button" class="btn btn-ghost" data-mode="daily">Daily</button>
           </div>
-          <span class="hint">Daily mode reconciles completed listening days using History Import's dated, duplicate-safe writes. Starts and finishes still sync within one polling interval.</span>
+          <span class="hint">Daily writes each day's listening as its own dated entry. Starts and finishes still sync at the next poll.</span>
         </div>
         <div class="field span2">
           <label>Auto-confirm Editions</label>
-          <div style="display:flex;gap:0.5rem;flex-wrap:wrap" id="auto-group">
-            <button type="button" class="btn btn-ghost auto-btn" data-auto="on">Strong Matches</button>
-            <button type="button" class="btn btn-ghost auto-btn" data-auto="off">Off</button>
+          <div class="button-row">
+            <button type="button" class="btn btn-ghost" data-auto="on">Strong Matches</button>
+            <button type="button" class="btn btn-ghost" data-auto="off">Off</button>
           </div>
-          <span class="hint">When you start a book, search StoryGraph for it and confirm the edition only on a strong match (the ABS tag, an ISBN/ASIN, or a runtime and narrator nothing else comes close to). The first write waits one sync so you can undo it on the Editions page. Anything weaker stays a suggestion.</span>
+          <span class="hint">Confirms a book's edition when you start it, if the match is strong. You can undo it on the Editions page before anything is written.</span>
         </div>
         <div class="field" id="daily-time-field" style="display:none">
           <label for="s-daily-time">Daily Sync Time</label>
@@ -103,7 +90,7 @@
       </div>
       <div class="form-footer">
         <button type="submit" class="btn btn-primary">Save Settings</button>
-        <span class="save-msg" id="save-msg">✓ Saved — changes take effect immediately</span>
+        <span class="save-msg" id="save-msg">✓ Saved</span>
       </div>
     </form>
   </div>
@@ -145,12 +132,4 @@
     <div class="log-box" id="log-box"></div>
   </div>
   {% endif %}
-
-</main>
-
-<div id="toast"></div>
-
-<script src="{{ asset_url('common.js') }}"></script>
-<script src="{{ asset_url('app.js') }}"></script>
-</body>
-</html>
+{% endblock %}

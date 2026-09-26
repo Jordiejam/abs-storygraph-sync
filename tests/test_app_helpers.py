@@ -2,12 +2,11 @@
 
 import json
 import os
-import shutil
-import tempfile
 import unittest
 from unittest import mock
 
 import app as A
+from conftest import isolate_state
 
 
 class _FakeResponse:
@@ -31,15 +30,12 @@ class HelperTests(unittest.TestCase):
     USER_ID = "user-1"
 
     def setUp(self):
-        self.data_dir = tempfile.mkdtemp(prefix="abs-sg-helpers-")
-        A._config_store = A._UserJsonStore(f"{self.data_dir}/config")
-        A._status_cache.clear()
+        self.data_dir = isolate_state(self)
         A.set_cfg(self.USER_ID, {"ABS_URL": "http://abs", "ABS_TOKEN": "token"})
         self.real_books = A.get_abs_books
 
     def tearDown(self):
         A.get_abs_books = self.real_books
-        shutil.rmtree(self.data_dir, ignore_errors=True)
 
     def test_a_failed_write_leaves_the_previous_file_intact(self):
         path = f"{self.data_dir}/state.json"
@@ -71,11 +67,11 @@ class HelperTests(unittest.TestCase):
             ]},
         }
 
-        def fake_get(url, **kwargs):
+        def fake_get(method, url, **kwargs):
             urls.append(url)
             return _FakeResponse(responses[url])
 
-        with mock.patch.object(A.req, "get", fake_get):
+        with mock.patch.object(A.req, "request", fake_get):
             books = A.get_abs_books(self.USER_ID, "in_progress")
 
         self.assertEqual([50.0, 10.0], [book["progress_percent"] for book in books])
@@ -83,13 +79,13 @@ class HelperTests(unittest.TestCase):
 
     def test_a_single_item_fetch_asks_abs_for_its_runtime(self):
         # ABS leaves media.duration out of an item unless it's expanded.
-        def fake_get(url, params=None, **kwargs):
+        def fake_get(method, url, params=None, **kwargs):
             media = {"metadata": {"title": "Book"}}
             if (params or {}).get("expanded"):
                 media["duration"] = 58252.2
             return _FakeResponse({"id": "item-1", "media": media})
 
-        with mock.patch.object(A.req, "get", fake_get):
+        with mock.patch.object(A.req, "request", fake_get):
             book = A.get_abs_book(self.USER_ID, "item-1", {})
         self.assertEqual(970.9, book["duration_minutes"])
 
@@ -113,8 +109,14 @@ class HelperTests(unittest.TestCase):
         old_id, new_id = "a" * 36, "b" * 36
         item = {"media": {"tags": ["Fantasy", f"storygraph:{old_id}"]}}
         patches = []
-        with mock.patch.object(A.req, "get", lambda url, **kwargs: _FakeResponse(item)), \
-                mock.patch.object(A.req, "patch", lambda url, **kwargs: patches.append((url, kwargs["json"])) or _FakeResponse({})):
+
+        def fake_request(method, url, **kwargs):
+            if method == "PATCH":
+                patches.append((url, kwargs["json"]))
+                return _FakeResponse({})
+            return _FakeResponse(item)
+
+        with mock.patch.object(A.req, "request", fake_request):
             self.assertTrue(A.write_storygraph_tag(self.USER_ID, "item-1", new_id))
             item["media"]["tags"] = ["Fantasy", f"storygraph:{new_id}"]
             self.assertFalse(A.write_storygraph_tag(self.USER_ID, "item-1", new_id))
@@ -126,10 +128,10 @@ class HelperTests(unittest.TestCase):
         buffer = A.LogBuffer(maxlen=2)
         for n in range(3):
             buffer.emit(A.logging.LogRecord("t", A.logging.INFO, "", 0, f"line {n}", None, None))
-        self.assertEqual([(2, "line 1"), (3, "line 2")], [(r["seq"], r["msg"]) for r in buffer.get()])
+        self.assertEqual([(2, "line 1"), (3, "line 2")], [(r["seq"], r["msg"]) for r in buffer.get()[0]])
 
     def test_a_missing_abs_item_is_none_rather_than_an_error(self):
-        with mock.patch.object(A.req, "get", lambda url, **kwargs: _FakeResponse({}, 404)):
+        with mock.patch.object(A.req, "request", lambda method, url, **kwargs: _FakeResponse({}, 404)):
             self.assertIsNone(A.get_abs_book(self.USER_ID, "gone", {}))
 
 

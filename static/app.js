@@ -1,12 +1,11 @@
 let autoRefresh = true;
 let timer;
-let lastLogSeq = 0;     // the newest log line shown
-let clearedLogSeq = 0;  // lines up to this one were cleared
+let lastLogSeq = 0;     // the newest log line fetched
 let readOnlyMode = false;
+let lastStatus = '';    // the last /api/status body rendered
+const MAX_LOG_LINES = 300;
 
-// The picked button in each settings toggle row, keyed by its data attribute:
-// data-scope="…" buttons set choices.scope, data-mode="…" set choices.mode,
-// data-auto="…" set choices.auto.
+// Each settings toggle row's pick, set by its data-scope/-mode/-auto buttons.
 const choices = { scope: null, mode: null, auto: null };
 
 const SCOPE_HEADERS = {
@@ -39,13 +38,19 @@ document.querySelectorAll('[data-scope], [data-mode], [data-auto]').forEach(btn 
 
 async function fetchStatus() {
   try {
-    const d = await getJSON('/api/status');
+    const r = await fetch('/api/status');
+    const body = await r.text();
+    // Nothing changes between polls most of the time; don't rebuild the page.
+    if (body === lastStatus) return;
+    const d = JSON.parse(body);
+    if (d.error) throw new Error(d.error);
+    lastStatus = body;
 
     setDot('d-abs', d.abs_ok);
     setDot('d-sg', d.sg_ok);
     readOnlyMode = Boolean(d.read_only);
     const pollMinutes = Math.round(d.poll_interval / 60);
-    document.querySelector('.mode-btn[data-mode="frequent"]').textContent = `Every ${pollMinutes} Minutes`;
+    document.querySelector('[data-mode="frequent"]').textContent = `Every ${pollMinutes} Minutes`;
     document.getElementById('l-poll').textContent = readOnlyMode
       ? 'Read-only dev'
       : d.sync_mode === 'daily'
@@ -57,14 +62,12 @@ async function fetchStatus() {
 
     const grid = document.getElementById('books-grid');
     if (!d.books?.length) {
-      grid.innerHTML = '<div class="empty-state">No audiobooks found for the current sync scope.</div>';
+      grid.innerHTML = emptyState('No audiobooks found for the current sync scope.');
       return;
     }
     grid.innerHTML = d.books.map(b => {
-      const synced = d.last_synced[b.abs_item_id];
-      const editionState = d.edition_states?.[b.abs_item_id] || 'unchecked';
-      const syncedLabel = synced != null
-        ? `Last synced at ${synced} min (${b.progress_percent}%)`
+      const syncedLabel = b.last_synced_minutes != null
+        ? `Last synced at ${b.last_synced_minutes} min (${b.progress_percent}%)`
         : 'Not yet synced this session';
       return `
         <div class="book-card">
@@ -84,7 +87,7 @@ async function fetchStatus() {
           <div class="last-sync">${esc(syncedLabel)}</div>
           <div class="book-actions">
             <button class="btn btn-ghost" onclick="openHistory(${jsArg(b.abs_item_id)})">History</button>
-            ${editionState === 'confirmed' ? '' : `<a class="btn btn-ghost" href="/editions?q=${encodeURIComponent(b.title)}">${editionBadge(editionState)} Edition</a>`}
+            ${b.edition_state === 'confirmed' ? '' : `<a class="btn btn-ghost" href="/editions?q=${encodeURIComponent(b.title)}">${editionBadge(b.edition_state)} Edition</a>`}
           </div>
         </div>`;
     }).join('');
@@ -113,15 +116,6 @@ function flagBadges(flags) {
 
 function pctText(percent) {
   return percent == null ? '—' : `${percent}%`;
-}
-
-function showCard(cardId, contentId, loadingText) {
-  const card = document.getElementById(cardId);
-  const content = document.getElementById(contentId);
-  card.style.display = 'block';
-  content.innerHTML = `<div class="empty-state">${esc(loadingText)}</div>`;
-  card.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  return content;
 }
 
 function historySummary(s) {
@@ -157,32 +151,33 @@ function closeHistory() {
   selectedDays = new Set();
 }
 
-// Shown even once an edition is confirmed: a match can land on the wrong
-// StoryGraph work, so correcting it must stay reachable.
+// Shown even once confirmed, since a match can land on the wrong work.
 function editionOverrideField(itemId, label) {
   return pasteEditionField('postEditionChoice', itemId, 'manual-edition-url', label,
     'Confirms that edition for both Sync and Import History — useful when a title search lands on the wrong StoryGraph work (e.g. a split-up dramatized adaptation).');
 }
 
-// Nothing is importable until a person has confirmed which StoryGraph edition
-// the entries attach to.
+// Nothing is importable until a person has confirmed the edition.
 function importableDays(data) {
-  if (data.edition_state !== 'confirmed') return [];
+  if (data.state !== 'confirmed') return [];
   return (data.days || []).filter(d => d.progress_percent != null && !d.already_imported && !d.already_logged_on_storygraph);
 }
 
 async function openHistory(itemId) {
-  const content = showCard('history-card', 'history-content', 'Loading ABS listening sessions…');
+  const card = document.getElementById('history-card');
+  const content = document.getElementById('history-content');
+  card.style.display = 'block';
+  content.innerHTML = emptyState('Loading ABS listening sessions…');
+  card.scrollIntoView({ behavior: 'smooth', block: 'start' });
   try {
     const d = await getJSON(`/api/history-import-preview/${encodeURIComponent(itemId)}`);
     historyView = { itemId, data: d };
-    // Flagged days start unticked, so a rewind or suspicious jump has to be
-    // opted into rather than waved through on an irreversible write.
+    // Flagged days start unticked: the write can't be undone.
     selectedDays = new Set(importableDays(d).filter(x => !x.flags?.length).map(x => x.key));
     document.getElementById('history-title').textContent = `History — ${d.book.title}`;
     renderHistory();
   } catch (e) {
-    content.innerHTML = `<div class="empty-state">${esc(e.message || 'Could not load history')}</div>`;
+    content.innerHTML = emptyState(e.message || 'Could not load history');
   }
 }
 
@@ -190,25 +185,26 @@ function editionSection(itemId, data) {
   if (!data.storygraph_ready) {
     return '<div class="history-note">Add a working StoryGraph session in Settings to match an edition and import these days.</div>';
   }
-  const edition = data.matched_edition;
+  const edition = data.edition;
   const pick = id => `postEditionChoice(${jsArg(itemId)}, ${jsArg(id)})`;
   const others = otherCandidates(data.candidates, edition);
-  if (data.edition_state === 'auto') {
-    return `<div class="history-note">${editionBadge('auto')} Edition: <strong>${editionTitleLink(edition, editionFallbackTitle(edition, data.book))}</strong> ${editionDetails(edition, data.book)}
+  const headline = label => `${editionBadge(data.state)} ${label}: <strong>${editionTitleLink(edition, editionFallbackTitle(edition, data.book))}</strong> ${editionDetails(edition, data.book)}`;
+  if (data.state === 'auto') {
+    return `<div class="history-note">${headline('Edition')}
       <button class="btn btn-primary" style="margin-left:0.5rem" onclick="${pick(edition.storygraph_book_id)}">Keep</button>
       <a class="btn btn-ghost" href="/editions?q=${encodeURIComponent(data.book.title)}">Review</a>
-      ${matchReasonText(data.match_reason)}</div>
+      ${matchReasonText(data.reason)}</div>
       <div class="history-note">Sync confirmed this edition automatically. Keep it before importing, since imported days can't be undone.</div>`;
   }
-  if (data.edition_state === 'confirmed') {
-    return `<div class="history-note">${editionBadge('confirmed')} Edition: <strong>${editionTitleLink(edition, editionFallbackTitle(edition, data.book))}</strong> ${editionDetails(edition, data.book)}</div>`;
+  if (data.state === 'confirmed') {
+    return `<div class="history-note">${headline('Edition')}</div>`;
   }
-  const lead = data.edition_state === 'suggested'
-    ? `<div class="history-note">${editionBadge('suggested')} Suggested edition: <strong>${editionTitleLink(edition, editionFallbackTitle(edition, data.book))}</strong> ${editionDetails(edition, data.book)}
+  const lead = data.state === 'suggested'
+    ? `<div class="history-note">${headline('Suggested edition')}
          <button class="btn btn-primary" style="margin-left:0.5rem" onclick="${pick(edition.storygraph_book_id)}">Confirm</button>
-         ${matchReasonText(data.match_reason)}${readEditionNote(data.match_reason, pick)}</div>
+         ${matchReasonText(data.reason)}${readEditionNote(data.reason, pick)}</div>
        <div class="history-note">Nothing can be imported until you confirm which StoryGraph edition this is.</div>`
-    : `<div class="history-note">Couldn't confidently match a StoryGraph audio edition — nothing can be imported until you pick one.${matchReasonText(data.match_reason)}${readEditionNote(data.match_reason, pick)}</div>`;
+    : `<div class="history-note">Couldn't confidently match a StoryGraph audio edition — nothing can be imported until you pick one.${matchReasonText(data.reason)}${readEditionNote(data.reason, pick)}</div>`;
   return `
     ${lead}
     ${others.length ? `<div class="edition-candidates">${candidateRows(others, data.book, pick)}</div>` : ''}
@@ -218,7 +214,7 @@ function editionSection(itemId, data) {
 function renderHistory() {
   const { itemId, data } = historyView;
   const content = document.getElementById('history-content');
-  const canImport = data.edition_state === 'confirmed';
+  const canImport = data.state === 'confirmed';
   const importable = importableDays(data);
   const importableKeys = new Set(importable.map(d => d.key));
 
@@ -274,8 +270,7 @@ function confirmLabel(count) {
   return `Confirm & Import ${plural(count, 'entry', 'entries')}`;
 }
 
-// Patch the button and note in place: a full re-render would drop the
-// checkbox the user just clicked.
+// Patched in place: a re-render would drop the checkbox just clicked.
 function toggleDay(key, on) {
   if (on) selectedDays.add(key); else selectedDays.delete(key);
   const btn = document.getElementById('import-confirm');
@@ -316,10 +311,9 @@ const FINISH_NOTES = {
 async function confirmImport(allowReread = false) {
   const { itemId } = historyView;
   const review = document.getElementById('import-review');
-  review.innerHTML = '<div class="empty-state">Writing to StoryGraph…</div>';
+  review.innerHTML = emptyState('Writing to StoryGraph…');
   try {
-    // Keys only — the server rebuilds each checkpoint's date and percentage
-    // from Audiobookshelf before writing anything.
+    // Keys only; the server rebuilds each day from Audiobookshelf.
     const result = await sendJSON(`/api/history-import/${encodeURIComponent(itemId)}`, {
       days: [...selectedDays],
       allow_reread: allowReread,
@@ -336,13 +330,12 @@ async function confirmImport(allowReread = false) {
       askReread(review);
       return;
     }
-    review.innerHTML = `<div class="empty-state">${esc(e.message || 'Import failed')}</div>`;
+    review.innerHTML = emptyState(e.message || 'Import failed');
   }
 }
 
 function askReread(review) {
-  // StoryGraph files every journal entry on a book it has as read under a
-  // new read, so these days can only go in as a reread.
+  // Entries on a book StoryGraph has as read start a new read.
   review.innerHTML = `
     <div class="history-note">
       This book is already marked read on StoryGraph. Importing these days
@@ -358,13 +351,13 @@ function askReread(review) {
 
 async function postEditionChoice(itemId, storygraphBookId) {
   const content = document.getElementById('history-content');
-  content.innerHTML = '<div class="empty-state">Confirming that edition…</div>';
+  content.innerHTML = emptyState('Confirming that edition…');
   try {
     await confirmEdition(itemId, storygraphBookId);
     openHistory(itemId);
     fetchStatus();
   } catch (e) {
-    content.innerHTML = `<div class="empty-state">${esc(e.message || 'Could not use that edition')}</div>`;
+    content.innerHTML = emptyState(e.message || 'Could not use that edition');
   }
 }
 
@@ -391,7 +384,7 @@ async function triggerSync() {
       r.progress_percent != null ? `<span class="result-pct">${r.progress_percent}%</span>` : '',
     )).join('');
     fetchStatus();
-    fetchLogs(true);
+    fetchLogs();
   } catch (e) {
     toast(e.message || 'Sync request failed', 'err');
   } finally {
@@ -466,7 +459,7 @@ async function loadUsers() {
         ${u.is_admin ? '<span class="badge success">admin</span>' : ''}
         ${u.via_oidc ? '<span class="badge not_found">sso</span>' : ''}
         <button class="btn btn-ghost" onclick="deleteUser(${jsArg(u.id)})">Remove</button>
-      </div>`).join('') || '<div class="empty-state">No users yet.</div>';
+      </div>`).join('') || emptyState('No users yet.');
   } catch (e) {
     toast('Could not load users', 'err');
   }
@@ -504,24 +497,28 @@ async function deleteUser(id) {
 
 // ── Logs ──────────────────────────────────────────────────────────────────
 
-async function fetchLogs(force = false) {
+// Each fetch appends only the lines after the newest one shown.
+async function fetchLogs() {
   const box = document.getElementById('log-box');
   if (!box) return;  // only rendered for admins
   try {
-    const d = await getJSON('/api/logs');
-    // The buffer drops old lines once full, so its length can stay put while
-    // new lines arrive; the newest line's number can't.
-    const newest = d.logs.at(-1)?.seq || 0;
-    if (newest === lastLogSeq && !force) return;
-    if (newest < lastLogSeq) clearedLogSeq = 0;  // the server restarted and numbers afresh
+    let d = await getJSON(`/api/logs?since=${lastLogSeq}`);
+    if (d.latest < lastLogSeq) {
+      // The server restarted and numbers afresh.
+      box.innerHTML = '';
+      lastLogSeq = 0;
+      d = await getJSON('/api/logs');
+    }
+    if (!d.logs.length) return;
     const atBottom = box.scrollHeight - box.scrollTop <= box.clientHeight + 40;
-    box.innerHTML = d.logs.filter(l => l.seq > clearedLogSeq).map(l => `
+    box.insertAdjacentHTML('beforeend', d.logs.map(l => `
       <div class="log-line">
         <span class="log-time">${esc(l.time)}</span>
         <span class="log-lvl ${esc(l.level)}">${esc(l.level.slice(0,4))}</span>
         <span class="log-msg ${l.level==='ERROR'?'err':''}">${esc(l.msg)}</span>
-      </div>`).join('');
-    lastLogSeq = newest;
+      </div>`).join(''));
+    while (box.children.length > MAX_LOG_LINES) box.firstElementChild.remove();
+    lastLogSeq = d.latest;
     if (atBottom) box.scrollTop = box.scrollHeight;
   } catch (e) {
     console.error('Log refresh failed', e);
@@ -530,36 +527,39 @@ async function fetchLogs(force = false) {
 
 function clearLogs() {
   document.getElementById('log-box').innerHTML = '';
-  clearedLogSeq = lastLogSeq;
 }
 
 function toggleAuto(btn) {
   autoRefresh = !autoRefresh;
   btn.classList.toggle('active', autoRefresh);
   btn.textContent = autoRefresh ? 'Auto-refresh' : 'Auto-refresh (off)';
-  if (autoRefresh) startTimer(); else clearInterval(timer);
+  if (autoRefresh) refresh(); else clearTimeout(timer);
 }
 
-function startTimer() {
-  clearInterval(timer);
-  timer = setInterval(() => { fetchStatus(); fetchLogs(); }, 5000);
+// Refresh now, then 5s after each refresh finishes, so a slow one never overlaps the next.
+let refreshing = false;
+async function refresh() {
+  clearTimeout(timer);
+  if (refreshing) return;  // the one in flight schedules the next
+  refreshing = true;
+  try {
+    await Promise.all([fetchStatus(), fetchLogs()]);
+  } finally {
+    refreshing = false;
+  }
+  if (autoRefresh && !document.hidden) timer = setTimeout(refresh, 5000);
 }
 
-// A hidden tab has no one to show a refresh to, and each status refresh can
-// cost Audiobookshelf a request per book.
+// A hidden tab has no one to show a refresh to.
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
-    clearInterval(timer);
+    clearTimeout(timer);
   } else if (autoRefresh) {
-    fetchStatus();
-    fetchLogs();
-    startTimer();
+    refresh();
   }
 });
 
 // ── Init ──────────────────────────────────────────────────────────────────
-fetchStatus();
-fetchLogs();
 loadSettings();
 if (document.getElementById('users-list')) loadUsers();
-startTimer();
+refresh();

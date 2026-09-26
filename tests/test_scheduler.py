@@ -1,11 +1,10 @@
 """Focused tests for auto-sync cadence and lifecycle boundaries."""
 
-import shutil
-import tempfile
 import unittest
 from datetime import date, datetime, timezone
 
 import app as A
+from conftest import isolate_state
 
 
 def progress(*, current=600, finished=False, started_at=100, finished_at=None):
@@ -37,13 +36,7 @@ class SchedulerTests(unittest.TestCase):
     USER_ID = "user-1"
 
     def setUp(self):
-        self.data_dir = tempfile.mkdtemp(prefix="abs-sg-scheduler-")
-        A._config_store = A._UserJsonStore(f"{self.data_dir}/config")
-        A._sync_store = A._UserJsonStore(f"{self.data_dir}/sync")
-        A._import_store = A._UserJsonStore(f"{self.data_dir}/import")
-        A._scheduler_store = A._UserJsonStore(f"{self.data_dir}/scheduler")
-        A._edition_store = A._UserJsonStore(f"{self.data_dir}/editions")
-        A._status_cache.clear()
+        isolate_state(self)
         A.set_cfg(self.USER_ID, {
             "ABS_URL": "http://abs",
             "ABS_TOKEN": "token",
@@ -77,7 +70,6 @@ class SchedulerTests(unittest.TestCase):
         A._finish_daily_history = self.real_finish_history
         A.StoryGraphClient = self.real_client
         A.get_abs_listening_sessions = self.real_sessions
-        shutil.rmtree(self.data_dir, ignore_errors=True)
 
     def initialized_state(self, **updates):
         state = A._scheduler_store.get(self.USER_ID)
@@ -324,10 +316,10 @@ class SchedulerTests(unittest.TestCase):
             def ensure_status(self, book_id, status, html=None):
                 return status_ok, True, ""
 
-            def mark_read(self, book_id, started=None, finished=None):
+            def mark_read(self, book_id, started=None, finished=None, html=None):
                 return self.ensure_status(book_id, "read")
 
-            def start_reading(self, book_id, started=None):
+            def start_reading(self, book_id, started=None, html=None):
                 return self.ensure_status(book_id, "currently-reading")
 
             def get_logged_progress_dates(self, book_id):
@@ -374,6 +366,20 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual([], sg["writes"])
 
         sg["label"] = "currently reading"
+        self.assertTrue(A._finish_daily_history(*args))
+        self.assertEqual([("sg-A Book", "2026-09-21")], sg["writes"])
+
+    def test_finish_history_waits_out_an_auto_confirm_hold(self):
+        sg = self.use_real_daily_run([])
+        sg["label"] = "currently reading"
+        entry = {"state": "confirmed", "edition": {"storygraph_book_id": "sg-A Book"}, "auto_confirmed_at": A.time.time()}
+        A._edition_store.get(self.USER_ID)["books"] = {"item-1": entry}
+        args = (self.USER_ID, book(finished=True), A.StoryGraphClient(), "jordan", date(2026, 9, 20), date(2026, 9, 21))
+
+        self.assertTrue(A._finish_daily_history(*args))
+        self.assertEqual([], sg["writes"])
+
+        entry["auto_confirmed_at"] -= A.POLL_INTERVAL
         self.assertTrue(A._finish_daily_history(*args))
         self.assertEqual([("sg-A Book", "2026-09-21")], sg["writes"])
 

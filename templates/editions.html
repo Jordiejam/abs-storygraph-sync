@@ -1,18 +1,7 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Editions · ABS → StoryGraph</title>
-  <link rel="stylesheet" href="{{ asset_url('theme.css') }}">
-  <link rel="stylesheet" href="{{ asset_url('app.css') }}">
-</head>
-<body>
-
-{% set active = 'editions' %}
-{% include '_header.html' %}
-
-<main>
+{% extends "_app_base.html" %}
+{% set active, script = 'editions', 'editions.js' %}
+{% block title %}Editions · ABS → StoryGraph{% endblock %}
+{% block content %}
   <div class="card">
     <div class="section-header">
       <h2>Editions</h2>
@@ -23,25 +12,13 @@
       </div>
     </div>
     <p class="text-dim editions-intro">
-      Sync and History Import only write to an edition you've confirmed here.
-      Tick books and search StoryGraph for them, then check each suggestion and confirm it.
-      With <strong>Auto-confirm Editions</strong> on in Settings, auto-sync also searches once for each book
-      you start listening to and confirms only strong matches (the ABS tag, an ISBN/ASIN, or a runtime and
-      narrator nothing else comes close to). Those wait under <strong>To review</strong>, and nothing is written
-      to them until the next sync, so a wrong one can be undone first. <strong>Sync ABS tags</strong> confirms books
-      already tagged <code>storygraph:&lt;id&gt;</code> in Audiobookshelf and tags the confirmed ones that aren't.
+      Sync only writes to editions you've confirmed. Tick books to search StoryGraph, then confirm the
+      suggestions. Editions picked automatically wait under <strong>To review</strong>.
     </p>
     <div class="editions-toolbar">
       <div class="filter-group" id="filter-group"></div>
-      <input type="text" id="edition-search" placeholder="Filter by title or author" oninput="renderEditions()">
+      <input type="text" id="edition-search" placeholder="Filter by title or author" oninput="searchChanged()">
     </div>
     <div id="editions-list"><div class="empty-state">Loading your library…</div></div>
   </div>
-</main>
-
-<div id="toast"></div>
-
-<script src="{{ asset_url('common.js') }}"></script>
-<script src="{{ asset_url('editions.js') }}"></script>
-</body>
-</html>
+{% endblock %}
