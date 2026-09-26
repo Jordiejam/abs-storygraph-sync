@@ -35,8 +35,7 @@ def _entry_ids(tag) -> list[str]:
 
 
 def soup(page: str | BeautifulSoup) -> BeautifulSoup:
-    """A journal page, parsed once. Every function here takes either the HTML
-    or this, so a caller reading one page several ways parses it only once."""
+    """A journal page, parsed; every function here takes the HTML or this."""
     return page if isinstance(page, BeautifulSoup) else BeautifulSoup(page, "html.parser")
 
 
@@ -46,12 +45,13 @@ def journal_entry_ids(page: str | BeautifulSoup) -> list[str]:
 
 
 def started_entry_ids(page: str | BeautifulSoup) -> list[str]:
-    """The "Started reading" entries on a journal page, dated or not: one per
-    read, begun when the book was set to currently reading."""
-    parsed = soup(page)
-    started = []
-    for entry_id in _entry_ids(parsed):
-        link = parsed.find("a", href=re.compile(re.escape(f"/journal_entries/{entry_id}/edit")))
+    """The "Started reading" entries on a journal page, one per read."""
+    started, seen = [], set()
+    for link in soup(page).find_all("a", href=_ENTRY_PATH_RE):
+        entry_id = _ENTRY_PATH_RE.search(link["href"]).group(1)
+        if entry_id in seen:
+            continue
+        seen.add(entry_id)
         # The whole entry is the largest ancestor that holds no other entry.
         block = link
         while block.parent is not None and len(_entry_ids(block.parent)) == 1:
@@ -62,18 +62,9 @@ def started_entry_ids(page: str | BeautifulSoup) -> list[str]:
 
 
 def _entry_container(link):
-    """Return the ancestor holding one full entry (date row + status/percent row).
-
-    StoryGraph's journal page puts the date in its own wrapper, sibling to the
-    status/percent wrapper. Several nested ancestors repeat the same
-    date-only text before an ancestor's text actually grows to include the
-    status/percent content too — that first ancestor whose text differs from
-    the date-only row is the full entry.
-
-    An undated entry ("No date") never matches a date on its own, so climbing
-    stops at the first ancestor holding another entry: past that, the date and
-    percent found would be a neighbour's.
-    """
+    """The ancestor holding one full entry: the first whose text grows past
+    the date-only row's. None past an ancestor holding another entry, where
+    the date and percent would be a neighbour's (as for "No date")."""
     date_row_text = None
     for parent in link.parents:
         if getattr(parent, "name", None) in {"body", "html"}:
@@ -113,12 +104,8 @@ def _entry_percent(container) -> float | None:
 
 
 def parse_journal_page(page: str | BeautifulSoup) -> list[JournalEntry]:
-    """Parse logged entries from a StoryGraph ``/journal?book_id=<id>`` page.
-
-    Relies on the visible date text and percent readout rather than layout
-    classes, since the site's markup changes fairly often (same philosophy as
-    matcher.py's edition parsing).
-    """
+    """Dated entries on a ``/journal?book_id=<id>`` page, read from visible
+    text rather than layout classes."""
     by_id: dict[str, JournalEntry] = {}
 
     for link in soup(page).find_all("a", href=True):
@@ -142,11 +129,6 @@ def parse_journal_page(page: str | BeautifulSoup) -> list[JournalEntry]:
 
 
 def progress_dates(entries: Iterable[JournalEntry]) -> set[str]:
-    """The dates that already carry a real progress entry.
-
-    Status-only entries ("Started reading", "Finished") are deliberately
-    excluded: they carry no percentage, and the import route's own
-    ensure_status() call creates one dated today — counting it would make the
-    import skip today's listening as already logged.
-    """
+    """The dates with a progress entry. Status-only entries don't count: an
+    import's own "Started reading" entry would hide today's listening."""
     return {entry.date for entry in entries if entry.percent is not None}

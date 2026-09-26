@@ -15,15 +15,6 @@ header {
   backdrop-filter: blur(12px);
 }
 
-.logo {
-  display: flex;
-  align-items: center;
-  gap: 0.625rem;
-  font-weight: 700;
-  font-size: 1rem;
-  letter-spacing: -0.02em;
-}
-
 .header-left { display: flex; align-items: center; gap: 1.5rem; }
 .header-right { display: flex; align-items: center; gap: 0.75rem; }
 
@@ -96,12 +87,7 @@ main {
   gap: 1.5rem;
 }
 
-.card {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 1.5rem;
-}
+.card { padding: 1.5rem; }
 
 .section-header {
   display: flex;
@@ -206,7 +192,7 @@ h2 {
   padding-top: 0.625rem;
 }
 
-.book-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+.book-actions, .filter-group, .button-row { display: flex; gap: 0.5rem; flex-wrap: wrap; }
 
 .history-summary {
   display: grid;
@@ -267,29 +253,15 @@ h2 {
 .field { display: flex; flex-direction: column; gap: 0.375rem; }
 .field.span2 { grid-column: 1 / -1; }
 
-label {
-  font-size: 0.68rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.07em;
-  color: var(--text-dim);
-}
+.label-note { font-weight: 400; text-transform: none; letter-spacing: 0; }
 
 .input-row { position: relative; }
 
 input[type="text"], input[type="password"], input[type="time"] {
-  width: 100%;
-  background: var(--surface2);
-  border: 1px solid var(--border);
-  border-radius: 8px;
   padding: 0.6rem 2.5rem 0.6rem 0.875rem;
-  color: var(--text);
   font-size: 0.8125rem;
   font-family: 'SF Mono', 'Fira Code', ui-monospace, monospace;
-  transition: border-color 0.15s;
-  outline: none;
 }
-input:focus { border-color: var(--accent); }
 input.is-set { border-color: #2d4a3e; background: #0f1f1a; }
 
 .eye-btn {
@@ -396,12 +368,9 @@ input.is-set { border-color: #2d4a3e; background: #0f1f1a; }
   flex-shrink: 0;
 }
 .badge.success { background: #0d2a1f; color: var(--green); }
-.badge.failed  { background: #2a0d0d; color: var(--red); }
-.badge.not_found { background: #1a1a0d; color: var(--yellow); }
-.badge.error   { background: #2a0d0d; color: var(--red); }
+.badge.failed, .badge.error { background: #2a0d0d; color: var(--red); }
+.badge.not_found, .badge.needs_edition, .badge.held { background: #1a1a0d; color: var(--yellow); }
 .badge.skipped { background: #1a1a0d; color: var(--text-dim); }
-.badge.needs_edition { background: #1a1a0d; color: var(--yellow); }
-.badge.held { background: #1a1a0d; color: var(--yellow); }
 
 .result-title { font-weight: 500; flex: 1; }
 .result-pct   { color: var(--text-dim); font-size: 0.72rem; }
@@ -432,7 +401,6 @@ a:hover { text-decoration: underline; }
   margin-bottom: 1rem;
 }
 .editions-toolbar input { max-width: 280px; padding-right: 0.875rem; }
-.filter-group { display: flex; gap: 0.5rem; flex-wrap: wrap; }
 .filter-group .count { color: var(--text-muted); font-size: 0.72rem; }
 
 .edition-row-wrap { border-bottom: 1px solid var(--border); padding: 0.875rem 0; }

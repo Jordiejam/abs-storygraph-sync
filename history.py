@@ -8,9 +8,8 @@ import re
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _GAP_DAYS_THRESHOLD = 7
-# New progress worth more than this multiple of the day's actual listening
-# time didn't come from listening — but never flag a jump smaller than the
-# floor, where normal seeking easily clears any ratio.
+# Progress beyond this multiple of the day's listening wasn't listened to;
+# jumps under the floor are just seeking.
 _JUMP_RATIO_THRESHOLD = 3
 _JUMP_MINUTES_FLOOR = 10
 
@@ -41,12 +40,8 @@ def _session_date(session: dict) -> str | None:
 
 
 def build_history_preview(sessions: list[dict], duration_minutes: float) -> dict:
-    """Collapse playback sessions into conservative daily checkpoints.
-
-    The furthest position reached is monotonic across days. Rewinds and repeated
-    passages still contribute listening time, but never move the proposed
-    StoryGraph checkpoint backwards.
-    """
+    """Collapse playback sessions into daily checkpoints at the furthest
+    position reached, which never moves backwards across days."""
     duration_seconds = max(0.0, _number(duration_minutes) * 60)
     grouped: dict[str, dict] = {}
     skipped = 0
@@ -133,16 +128,6 @@ def build_history_preview(sessions: list[dict], duration_minutes: float) -> dict
 
 
 def day_key(date: str, end_position_minutes) -> str:
-    """Stable id for one proposed daily checkpoint, so a History Import can
-    recognise a day across reruns and never write it twice.
-
-    Only the date and end position go in: the key is stored inside one dict per
-    ABS item inside one file per user, so the user, item and StoryGraph edition
-    are already fixed by where it lives. Kept human-readable rather than hashed
-    so a bad import can be diagnosed by reading the state file.
-    """
-    try:
-        position = float(end_position_minutes)
-    except (TypeError, ValueError):
-        position = 0.0
-    return f"{date}@{position:.1f}"
+    """A checkpoint's stable, readable id, so an import never writes a day
+    twice. The user and item are implied by where it's stored."""
+    return f"{date}@{_number(end_position_minutes):.1f}"

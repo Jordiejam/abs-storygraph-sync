@@ -7,14 +7,13 @@ let filter = null;
 let selected = new Set();       // item ids ticked for a lookup
 let busy = new Set();           // item ids with a request in flight
 let expanded = new Set();       // item ids with their edition picker open
-// Rows touched on this visit stay visible under the current filter even after
-// their state moves them out of it, so a finished lookup doesn't vanish.
+// Rows touched on this visit stay under the current filter, so a finished lookup doesn't vanish.
 let sticky = new Set();
 
 const FILTERS = {
-  review: { label: 'To review', match: b => b.state === 'suggested' || b.state === 'unmatched' || Boolean(b.auto_confirmed_at) },
+  review: { label: 'To review', match: b => ['suggested', 'unmatched', 'auto'].includes(b.state) },
   unchecked: { label: 'Not searched', match: b => b.state === 'unchecked' },
-  confirmed: { label: 'Confirmed', match: b => b.state === 'confirmed' },
+  confirmed: { label: 'Confirmed', match: b => ['confirmed', 'auto'].includes(b.state) },
   all: { label: 'All', match: () => true },
 };
 
@@ -37,8 +36,15 @@ async function loadEditions() {
     }
     renderEditions();
   } catch (e) {
-    document.getElementById('editions-list').innerHTML = `<div class="empty-state">${esc(e.message || 'Could not load your library')}</div>`;
+    document.getElementById('editions-list').innerHTML = emptyState(e.message || 'Could not load your library');
   }
+}
+
+// Typing waits a moment before re-rendering the whole list.
+let searchTimer;
+function searchChanged() {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(renderEditions, 150);
 }
 
 function setFilter(name) {
@@ -68,7 +74,7 @@ function renderEditions() {
   const note = storygraphReady ? '' : '<div class="history-note">Add your StoryGraph session in Settings to search for editions.</div>';
   list.innerHTML = note + (shown.length
     ? shown.map(rowHtml).join('')
-    : '<div class="empty-state">Nothing here.</div>');
+    : emptyState('Nothing here.'));
   updateLookupButton();
 }
 
@@ -92,7 +98,7 @@ function editionSummary(b) {
   const warning = b.synced_book_id && b.synced_book_id !== e.storygraph_book_id
     ? `<div class="edition-warning">Sync has written progress to <a href="${storygraphUrl(b.synced_book_id)}" target="_blank" rel="noopener">a different edition ↗</a>. That progress stays there; only new progress goes to this one.</div>`
     : '';
-  const tagDiffers = b.state === 'confirmed' && !b.auto_confirmed_at && b.storygraph_tag && b.storygraph_tag !== e.storygraph_book_id
+  const tagDiffers = b.state === 'confirmed' && b.storygraph_tag && b.storygraph_tag !== e.storygraph_book_id
     ? `<div class="read-note">
         <div>Audiobookshelf has this book tagged with ${editionTitleLink({ storygraph_book_id: b.storygraph_tag }, 'a different edition')}.
           Using it confirms that edition here instead; keeping this one re-tags the book.</div>
@@ -105,14 +111,13 @@ function editionSummary(b) {
   return `
     <div class="edition-title">${editionTitleLink(e, editionFallbackTitle(e, b))}</div>
     <div class="text-dim">${editionDetails(e, b) || 'No format or runtime on file'}</div>
-    ${b.state === 'suggested' || b.auto_confirmed_at ? matchReasonText(b.reason) + readEditionNote(b.reason, pickFor(b)) : ''}
+    ${b.state === 'suggested' || b.state === 'auto' ? matchReasonText(b.reason) + readEditionNote(b.reason, pickFor(b)) : ''}
     ${autoNote(b)}${warning}${tagDiffers}`;
 }
 
-// An edition sync confirmed itself: say so, and whether it has been written
-// to yet, with a way to keep it or put it back to a suggestion.
+// An automatic pick: whether it's written to yet, with Keep and Undo.
 function autoNote(b) {
-  if (!b.auto_confirmed_at) return '';
+  if (b.state !== 'auto') return '';
   const id = jsArg(b.abs_item_id);
   const held = b.held_until && b.held_until * 1000 > Date.now()
     ? ` Nothing is written to it until the next sync, around ${esc(new Date(b.held_until * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }))}.`
@@ -144,6 +149,7 @@ function rowActions(b) {
     case 'unmatched':
       return toggle('Choose…');
     case 'confirmed':
+    case 'auto':
       return toggle('Change…');
     default:
       return `<button class="btn btn-ghost" onclick="lookUp(${id})">Search</button>`;
@@ -154,20 +160,20 @@ function pickerHtml(b) {
   const id = jsArg(b.abs_item_id);
   const others = otherCandidates(b.candidates, b.edition);
   const pick = pickFor(b);
-  const inputId = `q-${b.abs_item_id}`;
   return `
     <div class="edition-picker">
       ${others.length
         ? `<div class="edition-candidates">${candidateRows(others, b, pick)}</div>`
         : `<div class="history-note">${b.state === 'unchecked' ? '' : 'No other editions came up in the last search.'}</div>`}
-      <div class="field" style="margin-top:1rem">
-        <label for="${esc(inputId)}">Search StoryGraph with different words</label>
-        <div class="picker-row">
-          <input type="text" id="${esc(inputId)}" value="${esc(`${b.title} ${b.author}`.trim())}">
-          <button class="btn btn-ghost" onclick="lookUp(${id}, document.getElementById(${jsArg(inputId)}).value)">Search</button>
-        </div>
-        <span class="hint">Useful when the top search result is the wrong book (a different work or a series box set).</span>
-      </div>
+      ${inputButtonField({
+        inputId: `q-${b.abs_item_id}`,
+        label: 'Search StoryGraph with different words',
+        button: 'Search',
+        value: `${b.title} ${b.author}`.trim(),
+        hint: 'Useful when the top search result is the wrong book (a different work or a series box set).',
+        margin: '1rem',
+        onclickJs: value => `lookUp(${id}, ${value})`,
+      })}
       ${pasteEditionField('pickEdition', b.abs_item_id, `u-${b.abs_item_id}`, 'Or paste a StoryGraph book URL or id')}
     </div>`;
 }
@@ -189,7 +195,7 @@ function rowHtml(b) {
             esc(b.publisher || ''),
           ].filter(Boolean).join(' · ')}</div>` : ''}
         </div>
-        <div class="edition-status">${editionBadge(b.auto_confirmed_at ? 'auto' : b.state)}<div>${editionSummary(b)}</div></div>
+        <div class="edition-status">${editionBadge(b.state)}<div>${editionSummary(b)}</div></div>
         <div class="edition-actions">${rowActions(b)}</div>
       </div>
       ${expanded.has(itemId) ? pickerHtml(b) : ''}
@@ -228,25 +234,33 @@ function updateLookupButton() {
   btn.textContent = running ? 'Searching…' : `Search selected${selected.size ? ` (${selected.size})` : ''}`;
 }
 
-// Returns false when there's no point carrying on with other books (the
-// StoryGraph session is bad).
-async function lookUp(itemId, query = '') {
+// Runs `fn` behind the row's spinner; a failure toasts errorText(e) and returns failed(e).
+async function withBusyRow(itemId, fn, errorText, failed) {
   busy.add(itemId);
   updateRow(itemId);
   try {
+    return await fn();
+  } catch (e) {
+    toast(errorText(e), 'err');
+    return failed(e);
+  } finally {
+    busy.delete(itemId);
+    updateRow(itemId);
+  }
+}
+
+// False when the StoryGraph session is bad, so other lookups can stop.
+function lookUp(itemId, query = '') {
+  return withBusyRow(itemId, async () => {
     const row = await sendJSON(`/api/editions/${encodeURIComponent(itemId)}/lookup`, { query });
     replaceBook(itemId, row);
     selected.delete(itemId);
     // A lookup that found nothing confident is only useful with the options open.
     if (row.state === 'unmatched') expanded.add(itemId);
     return true;
-  } catch (e) {
-    toast(`${books.find(b => b.abs_item_id === itemId)?.title || 'Book'}: ${e.message}`, 'err');
-    return !/session/i.test(e.message);
-  } finally {
-    busy.delete(itemId);
-    updateRow(itemId);
-  }
+  },
+  e => `${books.find(b => b.abs_item_id === itemId)?.title || 'Book'}: ${e.message}`,
+  e => !/session/i.test(e.message));
 }
 
 // One book at a time, in list order, to stay gentle on StoryGraph.
@@ -257,39 +271,20 @@ async function lookUpSelected() {
   }
 }
 
-async function pickEdition(itemId, storygraphBookId) {
-  busy.add(itemId);
-  updateRow(itemId);
-  try {
-    const d = await confirmEdition(itemId, storygraphBookId);
-    replaceBook(itemId, {
-      state: d.state,
-      edition: d.edition,
-      auto_confirmed_at: null,
-      held_until: null,
-      ...(d.tag_error ? {} : { storygraph_tag: d.edition.storygraph_book_id }),
-    });
+function pickEdition(itemId, storygraphBookId) {
+  return withBusyRow(itemId, async () => {
+    const { ok, tag_error, ...entry } = await confirmEdition(itemId, storygraphBookId);
+    replaceBook(itemId, { ...entry, ...(tag_error ? {} : { storygraph_tag: entry.edition.storygraph_book_id }) });
     expanded.delete(itemId);
-  } catch (e) {
-    toast(e.message || 'Could not use that edition', 'err');
-  } finally {
-    busy.delete(itemId);
-    updateRow(itemId);
-  }
+  }, e => e.message || 'Could not use that edition', () => {});
 }
 
-async function undoAuto(itemId) {
-  busy.add(itemId);
-  updateRow(itemId);
-  try {
-    replaceBook(itemId, await sendJSON(`/api/editions/${encodeURIComponent(itemId)}/undo-auto`, {}));
+function undoAuto(itemId) {
+  return withBusyRow(itemId, async () => {
+    const { ok, ...entry } = await sendJSON(`/api/editions/${encodeURIComponent(itemId)}/undo-auto`, {});
+    replaceBook(itemId, entry);
     toast('Back to a suggestion — confirm it or pick another edition');
-  } catch (e) {
-    toast(e.message || 'Could not undo that', 'err');
-  } finally {
-    busy.delete(itemId);
-    updateRow(itemId);
-  }
+  }, e => e.message || 'Could not undo that', () => {});
 }
 
 async function syncTags() {

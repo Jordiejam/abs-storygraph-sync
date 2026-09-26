@@ -1,23 +1,13 @@
-"""Route-level tests for the History Import flow.
-
-The pure reconstruction and parsing logic is covered in test_history.py and
-test_journal.py. What matters here is the orchestration the routes do around it:
-what gets skipped, what gets written, what survives a partial failure, and what
-the write endpoint refuses to trust.
-
-StoryGraph is replaced with a fake that records every call and keeps an
-in-memory journal, so these exercise the real Flask routes and the real state
-files without touching the network.
-"""
+"""Route tests: the real Flask routes and state files, with StoryGraph
+replaced by an in-memory fake that records every call."""
 
 import json
 import os
-import shutil
-import tempfile
 import unittest
 from unittest import mock
 
 import app as A
+from conftest import isolate_state
 from matcher import EditionCandidate
 
 
@@ -85,11 +75,11 @@ class FakeStoryGraph:
         self.calls.append(("journal", book_id))
         return {d for d, pct in FakeStoryGraph.journal.items() if pct is not None}
 
-    def start_reading(self, book_id, started=None):
+    def start_reading(self, book_id, started=None, html=None):
         self.calls.append(("start_reading", book_id, started))
         return self.ensure_status(book_id, "currently-reading")
 
-    def mark_read(self, book_id, started=None, finished=None):
+    def mark_read(self, book_id, started=None, finished=None, html=None):
         self.calls.append(("mark_read", book_id, started, finished))
         return self.ensure_status(book_id, "read")
 
@@ -116,19 +106,7 @@ class _ImportRouteCase(unittest.TestCase):
     ITEM = "item-abcdefgh"
 
     def setUp(self):
-        self.data_dir = tempfile.mkdtemp(prefix="abs-sg-case-")
-        for attr, path in (("CONFIG_DIR", "config"), ("SYNC_STATE_DIR", "sync_state"),
-                           ("IMPORT_STATE_DIR", "import_state"),
-                           ("SCHEDULER_STATE_DIR", "scheduler_state"),
-                           ("EDITIONS_DIR", "editions")):
-            setattr(A, attr, f"{self.data_dir}/{path}")
-        A.USERS_FILE = f"{self.data_dir}/users.json"
-        A._config_store = A._UserJsonStore(A.CONFIG_DIR)
-        A._sync_store = A._UserJsonStore(A.SYNC_STATE_DIR)
-        A._import_store = A._UserJsonStore(A.IMPORT_STATE_DIR)
-        A._scheduler_store = A._UserJsonStore(A.SCHEDULER_STATE_DIR)
-        A._edition_store = A._UserJsonStore(A.EDITIONS_DIR)
-        A._status_cache.clear()
+        isolate_state(self)
 
         self._real_client = A.StoryGraphClient
         self._real_resolve = A._resolve_abs_book
@@ -163,7 +141,6 @@ class _ImportRouteCase(unittest.TestCase):
         A.get_abs_listening_sessions = self._real_sessions
         A.write_storygraph_tag = self._real_tag
         A.READ_ONLY = False
-        shutil.rmtree(self.data_dir, ignore_errors=True)
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -204,11 +181,11 @@ class _ImportRouteCase(unittest.TestCase):
 class ImportPreviewTests(_ImportRouteCase):
     def test_preview_matches_and_persists_the_edition_with_one_editions_fetch(self):
         data = self.preview()
-        self.assertEqual(AUDIO.book_id, data["matched_edition"]["storygraph_book_id"])
-        self.assertEqual(600.0, data["matched_edition"]["duration_minutes"])
+        self.assertEqual(AUDIO.book_id, data["edition"]["storygraph_book_id"])
+        self.assertEqual(600.0, data["edition"]["duration_minutes"])
         loads = [c for c in FakeStoryGraph.instances[0].calls if c[0] == "load_editions"]
         self.assertEqual(1, len(loads))
-        self.assertEqual("suggested", data["edition_state"])
+        self.assertEqual("suggested", data["state"])
         self.assertEqual("suggested", self.stored_edition()["state"])
 
     def test_preview_offers_audio_candidates_when_nothing_matches_confidently(self):
@@ -217,15 +194,15 @@ class ImportPreviewTests(_ImportRouteCase):
             PRINT,
         ]
         data = self.preview()
-        self.assertEqual("unmatched", data["edition_state"])
-        self.assertIsNone(data["matched_edition"])
+        self.assertEqual("unmatched", data["state"])
+        self.assertIsNone(data["edition"])
         self.assertEqual([OTHER_ID], [c["storygraph_book_id"] for c in data["candidates"]])
 
     def test_preview_without_a_storygraph_session_is_history_only(self):
         A._config_store.get(self.user["id"]).pop("STORYGRAPH_SESSION")
         data = self.preview()
         self.assertFalse(data["storygraph_ready"])
-        self.assertIsNone(data["matched_edition"])
+        self.assertIsNone(data["edition"])
         self.assertEqual(3, len(data["days"]))
         self.assertEqual([], FakeStoryGraph.instances, "no StoryGraph session means no StoryGraph calls")
 
@@ -547,7 +524,7 @@ class EditionConfirmationTests(_ImportRouteCase):
         self.assertEqual(400, self.confirm("the-book-i-meant").status_code)
 
     def test_import_refuses_a_suggested_edition_until_it_is_confirmed(self):
-        self.assertEqual("suggested", self.preview()["edition_state"])
+        self.assertEqual("suggested", self.preview()["state"])
         r = self.do_import(["2026-01-07@180.0"])
         self.assertEqual(400, r.status_code)
         self.assertIn("Confirm a StoryGraph edition", r.get_json()["error"])
@@ -602,7 +579,7 @@ class EditionConfirmationTests(_ImportRouteCase):
         )
         marked = []
         fake = FakeStoryGraph()
-        fake.mark_read = lambda book_id, started=None, finished=None: marked.append((started, finished)) or (True, False, None)
+        fake.mark_read = lambda book_id, started=None, finished=None, html=None: marked.append((started, finished)) or (True, False, None)
         A.StoryGraphClient = lambda *a, **k: fake
 
         A.do_sync(user_id, [finished_book], label="jordan")
@@ -893,9 +870,10 @@ class AutoConfirmTests(_ImportRouteCase):
     def test_the_editions_list_and_status_flag_an_automatic_confirmation(self):
         self.auto_confirm()
         row = self.client.get("/api/editions").get_json()["books"][0]
-        self.assertEqual("confirmed", row["state"])
-        self.assertTrue(row["auto_confirmed_at"] and row["held_until"])
-        self.assertEqual({self.ITEM: "auto"}, self.client.get("/api/status").get_json()["edition_states"])
+        self.assertEqual("auto", row["state"])
+        self.assertTrue(row["held_until"])
+        statuses = self.client.get("/api/status").get_json()["books"]
+        self.assertEqual([(self.ITEM, "auto")], [(b["abs_item_id"], b["edition_state"]) for b in statuses])
 
     def test_keeping_it_makes_it_a_persons_confirmation_and_tags_it(self):
         self.auto_confirm()
