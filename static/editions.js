@@ -12,7 +12,7 @@ let expanded = new Set();       // item ids with their edition picker open
 let sticky = new Set();
 
 const FILTERS = {
-  review: { label: 'To review', match: b => b.state === 'suggested' || b.state === 'unmatched' },
+  review: { label: 'To review', match: b => b.state === 'suggested' || b.state === 'unmatched' || Boolean(b.auto_confirmed_at) },
   unchecked: { label: 'Not searched', match: b => b.state === 'unchecked' },
   confirmed: { label: 'Confirmed', match: b => b.state === 'confirmed' },
   all: { label: 'All', match: () => true },
@@ -92,7 +92,7 @@ function editionSummary(b) {
   const warning = b.synced_book_id && b.synced_book_id !== e.storygraph_book_id
     ? `<div class="edition-warning">Sync has written progress to <a href="${storygraphUrl(b.synced_book_id)}" target="_blank" rel="noopener">a different edition ↗</a>. That progress stays there; only new progress goes to this one.</div>`
     : '';
-  const tagDiffers = b.state === 'confirmed' && b.storygraph_tag && b.storygraph_tag !== e.storygraph_book_id
+  const tagDiffers = b.state === 'confirmed' && !b.auto_confirmed_at && b.storygraph_tag && b.storygraph_tag !== e.storygraph_book_id
     ? `<div class="read-note">
         <div>Audiobookshelf has this book tagged with ${editionTitleLink({ storygraph_book_id: b.storygraph_tag }, 'a different edition')}.
           Using it confirms that edition here instead; keeping this one re-tags the book.</div>
@@ -105,8 +105,28 @@ function editionSummary(b) {
   return `
     <div class="edition-title">${editionTitleLink(e, editionFallbackTitle(e, b))}</div>
     <div class="text-dim">${editionDetails(e, b) || 'No format or runtime on file'}</div>
-    ${b.state === 'suggested' ? matchReasonText(b.reason) + readEditionNote(b.reason, pickFor(b)) : ''}
-    ${warning}${tagDiffers}`;
+    ${b.state === 'suggested' || b.auto_confirmed_at ? matchReasonText(b.reason) + readEditionNote(b.reason, pickFor(b)) : ''}
+    ${autoNote(b)}${warning}${tagDiffers}`;
+}
+
+// An edition sync confirmed itself: say so, and whether it has been written
+// to yet, with a way to keep it or put it back to a suggestion.
+function autoNote(b) {
+  if (!b.auto_confirmed_at) return '';
+  const id = jsArg(b.abs_item_id);
+  const held = b.held_until && b.held_until * 1000 > Date.now()
+    ? ` Nothing is written to it until the next sync, around ${esc(new Date(b.held_until * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }))}.`
+    : ' Sync now writes to it.';
+  return `
+    <div class="read-note">
+      <div>Confirmed automatically on a strong match.${held}</div>
+      <div class="book-actions">
+        <button class="btn btn-ghost" onclick="pickEdition(${id}, ${jsArg(b.edition.storygraph_book_id)})"
+          title="Confirm it as your own pick, and tag it in Audiobookshelf">Keep</button>
+        <button class="btn btn-ghost" onclick="undoAuto(${id})"
+          title="Put it back to a suggestion. It won't be confirmed automatically again">Undo</button>
+      </div>
+    </div>`;
 }
 
 function pickFor(b) {
@@ -169,7 +189,7 @@ function rowHtml(b) {
             esc(b.publisher || ''),
           ].filter(Boolean).join(' · ')}</div>` : ''}
         </div>
-        <div class="edition-status">${editionBadge(b.state)}<div>${editionSummary(b)}</div></div>
+        <div class="edition-status">${editionBadge(b.auto_confirmed_at ? 'auto' : b.state)}<div>${editionSummary(b)}</div></div>
         <div class="edition-actions">${rowActions(b)}</div>
       </div>
       ${expanded.has(itemId) ? pickerHtml(b) : ''}
@@ -245,11 +265,27 @@ async function pickEdition(itemId, storygraphBookId) {
     replaceBook(itemId, {
       state: d.state,
       edition: d.edition,
+      auto_confirmed_at: null,
+      held_until: null,
       ...(d.tag_error ? {} : { storygraph_tag: d.edition.storygraph_book_id }),
     });
     expanded.delete(itemId);
   } catch (e) {
     toast(e.message || 'Could not use that edition', 'err');
+  } finally {
+    busy.delete(itemId);
+    updateRow(itemId);
+  }
+}
+
+async function undoAuto(itemId) {
+  busy.add(itemId);
+  updateRow(itemId);
+  try {
+    replaceBook(itemId, await sendJSON(`/api/editions/${encodeURIComponent(itemId)}/undo-auto`, {}));
+    toast('Back to a suggestion — confirm it or pick another edition');
+  } catch (e) {
+    toast(e.message || 'Could not undo that', 'err');
   } finally {
     busy.delete(itemId);
     updateRow(itemId);

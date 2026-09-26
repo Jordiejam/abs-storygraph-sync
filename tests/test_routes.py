@@ -811,11 +811,159 @@ class AdminPageTests(_ImportRouteCase):
         self.assertEqual(403, self.client.get("/api/users").status_code)
 
 
+class AutoConfirmTests(_ImportRouteCase):
+    """Auto-sync's own lookups and strong-match confirmations, and the hold
+    that keeps sync off an auto-confirmed edition until the next poll."""
+
+    def setUp(self):
+        super().setUp()
+        self._real_book = A.get_abs_book
+        self._real_books = A.get_abs_books
+        A.get_abs_book = lambda uid, iid, progress: dict(self.book, abs_item_id=iid)
+        A.get_abs_books = lambda user_id, scope, **kwargs: [dict(self.book)]
+
+    def tearDown(self):
+        A.get_abs_book = self._real_book
+        A.get_abs_books = self._real_books
+        super().tearDown()
+
+    def listening(self, **overrides):
+        return {"currentTime": 600, "isFinished": False, **overrides}
+
+    def auto_confirm(self, progress_by_item=None):
+        A._auto_confirm_editions(
+            self.user["id"], "jordan", progress_by_item or {self.ITEM: self.listening()}, FakeStoryGraph(),
+        )
+
+    def entry(self):
+        return A._edition_entry(self.user["id"], self.ITEM)
+
+    def test_a_new_book_with_an_identifier_match_is_confirmed_automatically(self):
+        self.auto_confirm()
+        entry = self.entry()
+        self.assertEqual("confirmed", entry["state"])
+        self.assertEqual(AUDIO.book_id, entry["edition"]["storygraph_book_id"])
+        self.assertTrue(entry["auto_confirmed_at"])
+        self.assertEqual([], self.tags_written, "an automatic pick must not be tagged as a person's")
+
+    def test_a_weak_match_stays_a_suggestion(self):
+        self.book["identifiers"] = []  # runtime only, and ABS lists no narrator
+        self.auto_confirm()
+        self.assertEqual("suggested", self.entry()["state"])
+        self.assertNotIn("auto_confirmed_at", self.entry())
+
+    def test_only_books_being_listened_to_are_looked_up_and_only_once(self):
+        self.auto_confirm({
+            "item-finished": self.listening(isFinished=True),
+            "item-unstarted": self.listening(currentTime=0),
+            "item-hidden": self.listening(hideFromContinueListening=True),
+        })
+        self.assertEqual([], FakeStoryGraph.instances[-1].calls)
+        self.book["identifiers"] = []
+        self.auto_confirm()
+        self.auto_confirm()
+        lookups = [c for f in FakeStoryGraph.instances for c in f.calls if c[0] == "load_editions"]
+        self.assertEqual(1, len(lookups))
+
+    def test_lookups_are_capped_per_poll(self):
+        items = {f"item-{n:08d}": self.listening() for n in range(A.AUTO_LOOKUPS_PER_POLL + 2)}
+        self.auto_confirm(items)
+        self.assertEqual(A.AUTO_LOOKUPS_PER_POLL, len(A._editions(self.user["id"])))
+
+    def test_turned_off_it_neither_searches_nor_confirms(self):
+        A.set_cfg(self.user["id"], {"AUTO_CONFIRM_EDITIONS": "off"})
+        self.auto_confirm()
+        self.assertEqual({}, self.entry())
+
+    def test_a_signed_out_session_stops_the_lookups(self):
+        FakeStoryGraph.search_signed_out = True
+        self.auto_confirm({f"item-{n:08d}": self.listening() for n in range(3)})
+        self.assertEqual(1, len([c for f in FakeStoryGraph.instances for c in f.calls if c[0] == "load_editions"]))
+
+    def test_sync_holds_the_first_write_until_the_next_poll(self):
+        self.auto_confirm()
+        results, posted, _ = self.sync_with_recording_fake()
+        self.assertEqual(["held"], [r["status"] for r in results])
+        self.assertEqual([], posted)
+        self.entry()["auto_confirmed_at"] -= A.POLL_INTERVAL
+        results, posted, _ = self.sync_with_recording_fake()
+        self.assertEqual(["success"], [r["status"] for r in results])
+        self.assertEqual({AUDIO.book_id}, {book_id for _, book_id in posted})
+
+    def test_the_editions_list_and_status_flag_an_automatic_confirmation(self):
+        self.auto_confirm()
+        row = self.client.get("/api/editions").get_json()["books"][0]
+        self.assertEqual("confirmed", row["state"])
+        self.assertTrue(row["auto_confirmed_at"] and row["held_until"])
+        self.assertEqual({self.ITEM: "auto"}, self.client.get("/api/status").get_json()["edition_states"])
+
+    def test_keeping_it_makes_it_a_persons_confirmation_and_tags_it(self):
+        self.auto_confirm()
+        self.confirm(AUDIO.book_id)
+        self.assertNotIn("auto_confirmed_at", self.entry())
+        self.assertEqual([(self.ITEM, AUDIO.book_id)], self.tags_written)
+
+    def test_undo_makes_it_a_suggestion_that_is_never_auto_confirmed_again(self):
+        self.auto_confirm()
+        r = self.client.post(f"/api/editions/{self.ITEM}/undo-auto", json={})
+        self.assertEqual(200, r.status_code)
+        self.assertEqual("suggested", self.entry()["state"])
+        self.auto_confirm()
+        self.assertEqual("suggested", self.entry()["state"])
+        self.assertEqual(409, self.client.post(f"/api/editions/{self.ITEM}/undo-auto", json={}).status_code)
+
+    def test_undo_refuses_a_persons_confirmation(self):
+        self.confirm(AUDIO.book_id)
+        self.assertEqual(409, self.client.post(f"/api/editions/{self.ITEM}/undo-auto", json={}).status_code)
+        self.assertEqual("confirmed", self.entry()["state"])
+
+    def test_history_import_waits_for_a_person_to_keep_it(self):
+        self.auto_confirm()
+        r = self.do_import(["2026-01-07@180.0"])
+        self.assertEqual(400, r.status_code)
+        self.assertIn("Review the automatically confirmed edition", r.get_json()["error"])
+
+    def test_tag_sync_never_tags_it_and_an_abs_tag_overrides_it(self):
+        self.auto_confirm()
+        d = self.client.post("/api/editions/sync-tags", json={}).get_json()
+        self.assertEqual((0, 0), (d["tagged"], d["confirmed"]))
+        self.assertEqual([], self.tags_written)
+
+        A.get_abs_books = lambda user_id, scope, **kwargs: [dict(self.book, storygraph_tag=OTHER_ID)]
+        d = self.client.post("/api/editions/sync-tags", json={}).get_json()
+        self.assertEqual((1, []), (d["confirmed"], d["conflicts"]))
+        self.assertEqual(OTHER_ID, self.entry()["edition"]["storygraph_book_id"])
+        self.assertNotIn("auto_confirmed_at", self.entry())
+
+    def test_a_poll_auto_confirms_then_writes_on_the_next_one(self):
+        A.set_cfg(self.user["id"], {"SYNC_MODE": "frequent"})
+        A._scheduler_store.get(self.user["id"]).update({"initialized": True, "books": {}})
+        progress = {self.ITEM: {**self.listening(), "startedAt": 100, "progress": 0.5}}
+        writes = []
+        with mock.patch.object(A, "get_abs_progress", lambda uid: progress), \
+                mock.patch.object(FakeStoryGraph, "start_reading", create=True,
+                                  new=lambda fake, book_id, started=None: writes.append(book_id) or (True, False, None)), \
+                mock.patch.object(FakeStoryGraph, "update_progress", create=True,
+                                  new=lambda fake, book_id, pct, html=None: True):
+            A._poll_user(self.user)
+            self.assertEqual("auto", A._edition_state(self.entry()))
+            self.assertEqual([], writes)
+            self.entry()["auto_confirmed_at"] -= A.POLL_INTERVAL
+            A._poll_user(self.user)
+            self.assertEqual([AUDIO.book_id], writes)
+
+
 class SyncSettingsTests(_ImportRouteCase):
     def test_sync_settings_default_to_frequent_and_midnight(self):
         settings = self.client.get("/api/settings").get_json()
         self.assertEqual("frequent", settings["SYNC_MODE"])
         self.assertEqual("00:00", settings["DAILY_SYNC_TIME"])
+
+    def test_auto_confirm_defaults_on_and_is_validated(self):
+        self.assertEqual("on", self.client.get("/api/settings").get_json()["AUTO_CONFIRM_EDITIONS"])
+        self.assertEqual(400, self.client.post("/api/settings", json={"AUTO_CONFIRM_EDITIONS": "maybe"}).status_code)
+        self.assertEqual(200, self.client.post("/api/settings", json={"AUTO_CONFIRM_EDITIONS": "off"}).status_code)
+        self.assertEqual("off", self.client.get("/api/settings").get_json()["AUTO_CONFIRM_EDITIONS"])
 
     def test_daily_settings_are_validated_and_saved(self):
         self.assertEqual(400, self.client.post("/api/settings", json={"SYNC_MODE": "sometimes"}).status_code)

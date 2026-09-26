@@ -13,7 +13,7 @@ Runs as a lightweight Docker container alongside ABS. No browser automation — 
 - Configurable sync scope: just in-progress books, in-progress + finished, or your entire library
 - Web UI to manage credentials, view logs, and trigger a manual sync
 - Progress is only pushed to StoryGraph when it actually changes (no duplicate journal entries)
-- An **Editions** page where you match each book to its StoryGraph edition: tick books to search, check the suggestion (ISBN/ASIN match or closest runtime), and confirm it. Sync only ever writes to a confirmed edition
+- An **Editions** page where you match each book to its StoryGraph edition: tick books to search, check the suggestion (ISBN/ASIN match or closest runtime), and confirm it. Sync only ever writes to a confirmed edition, and can confirm strong matches for books you start listening to by itself
 - Daily history reconstructed from Audiobookshelf playback sessions, shown day by day for review before an opt-in History Import that backdates StoryGraph journal entries
 - Accounts, settings, and sync state persist across restarts
 
@@ -126,12 +126,24 @@ The app still checks Audiobookshelf every `POLL_INTERVAL` seconds in Daily mode,
 
 ## Editions
 
-Sync and History Import only write to a StoryGraph edition you have confirmed, so
+Sync and History Import only write to a confirmed StoryGraph edition, so
 nothing lands on the wrong edition by guesswork. The **Editions** page lists your
 whole ABS library, whatever your sync scope:
 
-- Tick books and select **Search selected**. They are looked up one at a time, and
-  only when you ask. Sync itself never searches StoryGraph.
+- Tick books and select **Search selected**. They are looked up one at a time.
+- With **Auto-confirm Editions** on in Settings (the default), auto-sync also
+  looks up each book you start listening to, once, and a few per poll at most.
+  It confirms the edition itself only on a strong match: the ABS tag, an exact
+  ISBN/ASIN, or a runtime match whose narrator agrees with ABS and that no other
+  edition comes close to (unless the narrator or your earlier read sets it
+  apart). A narrator or language that disagrees rules it out. Anything weaker
+  stays a suggestion for you to confirm.
+  - Nothing is written to an auto-confirmed edition until the next poll, so you
+    have one polling interval to catch a wrong pick. Auto-confirmed books appear
+    under **To review** with **Keep** and **Undo**. Undo turns the pick back into
+    a suggestion and the book is never auto-confirmed again.
+  - An auto-confirmed edition isn't tagged in ABS, and History Import won't write
+    to it, until you keep it.
 - Lookups read StoryGraph's audio-only edition list (up to three pages, in the
   book's language when ABS knows it) as well as the first page of all editions.
 - A confident match (exact ISBN/ASIN, or a runtime within a conservative tolerance)
@@ -146,8 +158,8 @@ whole ABS library, whatever your sync scope:
   by hand in ABS. Writing it needs an ABS user allowed to update books; without
   that permission the edition is still confirmed, just not tagged.
 - **Sync ABS tags** lines the two up across the whole library: books tagged in
-  ABS but not confirmed here are confirmed as the tagged edition, and confirmed
-  books without a tag get one. A book confirmed as a different edition from its
+  ABS but not confirmed here (or only auto-confirmed) are confirmed as the
+  tagged edition, and books you confirmed without a tag get one. A book confirmed as a different edition from its
   tag is left alone and flagged on its row, so you can pick which to keep. It
   only talks to ABS, never StoryGraph.
 - A book without a confirmed edition is skipped by sync and reported as

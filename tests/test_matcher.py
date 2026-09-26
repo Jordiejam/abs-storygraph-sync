@@ -2,7 +2,7 @@ import unittest
 from dataclasses import replace
 
 from matcher import (
-    AudiobookDetails, EditionCandidate, edition_checks, match_audio_edition,
+    AudiobookDetails, EditionCandidate, edition_checks, is_strong_match, match_audio_edition,
     merge_editions, parse_filtered_editions, parse_storygraph_editions,
 )
 
@@ -365,6 +365,41 @@ class MatcherTests(unittest.TestCase):
 
 def audio(key, minutes, *, narrators=(), publisher="Pub", language="English"):
     return EditionCandidate(key * 36, "Book", "Audio", minutes, None, language, publisher, narrators)
+
+
+class StrongMatchTests(unittest.TestCase):
+    NARRATOR_OK = {"narrator": True, "language": True}
+
+    def test_a_tag_is_strong_whatever_the_checks_say(self):
+        self.assertTrue(is_strong_match({"code": "tagged"}, {"narrator": False, "language": False}))
+
+    def test_an_identifier_match_is_strong_unless_the_narrator_or_language_disagrees(self):
+        self.assertTrue(is_strong_match({"code": "identifier"}, {"narrator": None}))
+        self.assertFalse(is_strong_match({"code": "identifier"}, {"narrator": False}))
+        self.assertFalse(is_strong_match({"code": "identifier"}, {"language": False}))
+
+    def test_a_runtime_match_needs_a_matching_narrator(self):
+        self.assertTrue(is_strong_match({"code": "runtime", "others_within_tolerance": 0}, self.NARRATOR_OK))
+        self.assertFalse(is_strong_match({"code": "runtime", "others_within_tolerance": 0}, {"narrator": None}))
+
+    def test_a_runtime_match_among_close_rivals_needs_the_narrator_or_a_read_to_set_it_apart(self):
+        tied = {"code": "runtime", "others_within_tolerance": 2}
+        self.assertFalse(is_strong_match(tied, self.NARRATOR_OK))
+        self.assertFalse(is_strong_match({**tied, "decided_by": ["publisher"]}, self.NARRATOR_OK))
+        self.assertTrue(is_strong_match({**tied, "decided_by": ["narrator"]}, self.NARRATOR_OK))
+        self.assertTrue(is_strong_match({**tied, "decided_by": ["read_before"]}, self.NARRATOR_OK))
+
+    def test_weaker_reasons_and_no_reason_are_never_strong(self):
+        for code in ("only_audio", "runtime_mismatch", "no_results", None):
+            self.assertFalse(is_strong_match({"code": code}, self.NARRATOR_OK), code)
+        self.assertFalse(is_strong_match(None, None))
+
+    def test_a_runtime_match_with_the_abs_narrator_and_no_rival_is_strong_end_to_end(self):
+        edition = EditionCandidate("a", "Book", "Audio", 600.0, None, "English", "Pub", ("Jane Reader",))
+        details = AudiobookDetails(narrators=("Jane Reader",))
+        best, reason = match_audio_edition([edition], target_duration_minutes=601, details=details)
+        self.assertIs(edition, best)
+        self.assertTrue(is_strong_match(reason, edition_checks(best, details)))
 
 
 if __name__ == "__main__":

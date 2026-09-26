@@ -31,6 +31,7 @@ const EDITION_STATES = {
   suggested: { label: 'Suggested', badge: 'not_found' },
   unmatched: { label: 'No match', badge: 'failed' },
   confirmed: { label: 'Confirmed', badge: 'success' },
+  auto: { label: 'Auto-confirmed', badge: 'not_found' },
 };
 
 function editionBadge(state) {

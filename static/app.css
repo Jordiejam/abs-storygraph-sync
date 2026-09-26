@@ -401,6 +401,7 @@ input.is-set { border-color: #2d4a3e; background: #0f1f1a; }
 .badge.error   { background: #2a0d0d; color: var(--red); }
 .badge.skipped { background: #1a1a0d; color: var(--text-dim); }
 .badge.needs_edition { background: #1a1a0d; color: var(--yellow); }
+.badge.held { background: #1a1a0d; color: var(--yellow); }
 
 .result-title { font-weight: 500; flex: 1; }
 .result-pct   { color: var(--text-dim); font-size: 0.72rem; }

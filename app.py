@@ -23,7 +23,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from authlib.integrations.flask_client import OAuth
 from matcher import (
     STORYGRAPH_ID_PATTERN, AudiobookDetails, bare_edition, edition_checks,
-    match_audio_edition, merge_editions, normalise_language, parse_filtered_editions,
+    is_strong_match, match_audio_edition, merge_editions, normalise_language, parse_filtered_editions,
     parse_storygraph_editions,
 )
 from history import build_history_preview, day_key
@@ -61,12 +61,16 @@ PUBLIC_URL = (os.environ.get("PUBLIC_URL") or "").rstrip("/")
 
 SYNC_SCOPES = ("in_progress", "in_progress_finished", "library")
 SYNC_MODES = ("frequent", "daily")
+AUTO_CONFIRM_CHOICES = ("on", "off")
 # What cfg() returns for a setting a user hasn't saved.
 CFG_DEFAULTS = {
     "SYNC_SCOPE": "in_progress",
     "SYNC_MODE": "frequent",
     "DAILY_SYNC_TIME": "00:00",
     "TIMEZONE": "UTC",
+    # Whether auto-sync finds and confirms strong edition matches itself; see
+    # _auto_confirm_editions.
+    "AUTO_CONFIRM_EDITIONS": "on",
 }
 # Settings the UI may save; the secret ones are never sent back to it.
 SECRET_SETTINGS = ("ABS_TOKEN", "STORYGRAPH_SESSION", "STORYGRAPH_REMEMBER_TOKEN")
@@ -308,9 +312,14 @@ def set_cfg(user_id: str, updates: dict):
 #              confirmation existed) — nothing is written to it yet
 #   unmatched  a lookup found nothing confident; "candidates" holds the options
 #   confirmed  a person chose or approved "edition" — the only state sync and
-#              History Import will ever write to
-# A book with no entry has never been looked up. Lookups only ever happen when
-# a person asks for one; nothing here searches StoryGraph on its own.
+#              History Import will ever write to — or, with "auto_confirmed_at"
+#              set, auto-sync confirmed a strong match itself and nobody has
+#              reviewed it yet
+# A book with no entry has never been looked up. Lookups happen when a person
+# asks for one, and, with AUTO_CONFIRM_EDITIONS on, once for each book that
+# starts being listened to (see _auto_confirm_editions). "auto_declined" marks
+# a book whose auto-confirmed edition a person undid, so it's never
+# auto-confirmed again.
 
 
 def _editions(user_id: str) -> dict[str, dict]:
@@ -342,8 +351,11 @@ def _bare_edition_json(storygraph_book_id: str, title: str | None = None) -> dic
 
 
 def _confirm_entry(entry: dict, edition: dict):
+    """A person's confirmation, which also counts as reviewing any automatic one."""
     entry.update(state="confirmed", edition=edition, confirmed_at=time.time())
     entry.setdefault("candidates", [])
+    entry.pop("auto_confirmed_at", None)
+    entry.pop("auto_declined", None)
 
 
 def _migrate_legacy_state(user_id: str):
@@ -394,11 +406,27 @@ def _edition_entry(user_id: str, item_id: str | None) -> dict:
 
 
 def _confirmed_edition_id(user_id: str, item_id: str | None) -> str | None:
-    """The StoryGraph book id a person confirmed for this ABS item, if any."""
+    """The StoryGraph book id confirmed for this ABS item, if any."""
     entry = _edition_entry(user_id, item_id)
     if entry.get("state") != "confirmed":
         return None
     return (entry.get("edition") or {}).get("storygraph_book_id")
+
+
+def _auto_hold_until(entry: dict) -> float | None:
+    """When sync may first write to an auto-confirmed edition: one poll
+    interval after it was confirmed, so the next poll is the first to write
+    and a wrong pick can be caught on the Editions page before then."""
+    confirmed_at = entry.get("auto_confirmed_at")
+    return confirmed_at + POLL_INTERVAL if confirmed_at else None
+
+
+def _edition_state(entry: dict) -> str:
+    """The state the pages show: an unreviewed automatic confirmation is
+    told apart from a person's as "auto"."""
+    if entry.get("state") == "confirmed" and entry.get("auto_confirmed_at"):
+        return "auto"
+    return entry.get("state", "unchecked")
 
 # ── ABS ───────────────────────────────────────────────────────────────────────
 
@@ -1135,6 +1163,14 @@ def do_sync(
                 logger.info("[%s] '%s' has no confirmed StoryGraph edition — skipping", label, book["title"])
                 results.append(_sync_result(book, "needs_edition"))
                 continue
+            held_until = _auto_hold_until(_edition_entry(user_id, item_id))
+            if held_until and time.time() < held_until:
+                logger.info(
+                    "[%s] '%s': edition %s was confirmed automatically — holding its first write until the next sync",
+                    label, book["title"], book_id,
+                )
+                results.append(_sync_result(book, "held"))
+                continue
             if prev and prev.get("storygraph_book_id") != book_id:
                 if prev.get("storygraph_book_id"):
                     logger.info(
@@ -1700,6 +1736,55 @@ def _run_daily(
         )
 
 
+AUTO_LOOKUPS_PER_POLL = 3
+
+
+def _auto_confirm_editions(user_id: str, label: str, progress_by_item: dict[str, dict], client: StoryGraphClient):
+    """With AUTO_CONFIRM_EDITIONS on, give the books being listened to an
+    edition without waiting for a person: a book never looked up is searched
+    once (a few per poll, to stay gentle on StoryGraph), and a strong
+    suggestion is confirmed (see matcher.is_strong_match). Anything weaker
+    stays a suggestion to review. An automatic confirmation is marked as one
+    until a person reviews it, isn't tagged in ABS, since a tag counts as a
+    person's pick, and isn't written to until the next poll (_auto_hold_until)."""
+    if cfg(user_id, "AUTO_CONFIRM_EDITIONS") != "on":
+        return
+    editions = _editions(user_id)
+    lookups = 0
+    for item_id, progress in progress_by_item.items():
+        if progress.get("isFinished") or progress.get("hideFromContinueListening") or not _has_started(progress):
+            continue
+        if item_id not in editions:
+            if lookups >= AUTO_LOOKUPS_PER_POLL:
+                continue
+            lookups += 1
+            try:
+                book = get_abs_book(user_id, item_id, progress)
+                if not book:
+                    continue
+                _look_up_edition(user_id, client, book)
+            except StoryGraphAuthError as exc:
+                logger.warning("[%s] Auto-confirm: %s", label, exc)
+                return
+            except req.RequestException as exc:
+                logger.warning("[%s] Auto-confirm: could not look up an edition for %s: %s", label, item_id, exc)
+                continue
+        entry = editions[item_id]
+        edition = entry.get("edition") or {}
+        if (
+            entry.get("state") == "suggested"
+            and not entry.get("auto_declined")
+            and is_strong_match(entry.get("reason"), edition.get("checks"))
+        ):
+            _confirm_entry(entry, edition)
+            entry["auto_confirmed_at"] = entry["confirmed_at"]
+            _edition_store.save(user_id)
+            logger.info(
+                "[%s] Auto-confirmed StoryGraph edition %s for %s (%s match); nothing is written to it until the next sync",
+                label, edition.get("storygraph_book_id"), item_id, (entry.get("reason") or {}).get("code"),
+            )
+
+
 def _poll_user(user: dict, now: datetime | None = None):
     user_id = user["id"]
     if _missing_cfg(user_id, SYNC_KEYS):
@@ -1708,6 +1793,8 @@ def _poll_user(user: dict, now: datetime | None = None):
     label = _user_label(user)
     try:
         progress_by_item = get_abs_progress(user_id)
+        client = _storygraph_client(user_id)
+        _auto_confirm_editions(user_id, label, progress_by_item, client)
         scheduler_state = _scheduler_store.get(user_id)
         was_initialized = bool(scheduler_state.get("initialized"))
         changes = _pending_lifecycle_changes(user_id, progress_by_item, scheduler_state)
@@ -1722,7 +1809,6 @@ def _poll_user(user: dict, now: datetime | None = None):
             scoped_books = get_abs_books(user_id, scope, progress_by_item=progress_by_item)
             _cache_books(user_id, scope, scoped_books)
 
-        client = _storygraph_client(user_id)
         books = _lifecycle_books(user_id, mode, changes, progress_by_item, scoped_books)
         _sync_lifecycle(
             user_id, label, mode, books, changes, progress_by_item, scheduler_state, local_date, client,
@@ -1941,7 +2027,7 @@ def api_status():
         "books": books,
         "last_synced": last,
         "edition_states": {
-            book["abs_item_id"]: _edition_entry(user_id, book["abs_item_id"]).get("state", "unchecked")
+            book["abs_item_id"]: _edition_state(_edition_entry(user_id, book["abs_item_id"]))
             for book in books
         },
     })
@@ -2085,6 +2171,8 @@ def _edition_row(user_id: str, book: dict, entry: dict) -> dict:
         "edition": entry.get("edition"),
         "candidates": entry.get("candidates", []),
         "checked_at": entry.get("checked_at"),
+        "auto_confirmed_at": entry.get("auto_confirmed_at"),
+        "held_until": _auto_hold_until(entry),
         "reason": entry.get("reason"),
         # Progress already sent here stays on StoryGraph if a different
         # edition is confirmed, so the page can warn before that happens.
@@ -2144,7 +2232,7 @@ def api_history_import_preview(item_id):
                 "storygraph_tag": book.get("storygraph_tag"),
             },
             "storygraph_ready": storygraph_ready,
-            "edition_state": entry.get("state", "unchecked"),
+            "edition_state": _edition_state(entry),
             "matched_edition": entry.get("edition"),
             "candidates": entry.get("candidates", []),
             "match_reason": entry.get("reason"),
@@ -2181,6 +2269,10 @@ def api_history_import(item_id):
     storygraph_book_id = _confirmed_edition_id(user_id, item_id)
     if not storygraph_book_id:
         return jsonify({"error": "Confirm a StoryGraph edition for this book before importing"}), 400
+    # An import's dated entries can't be undone, so an edition sync confirmed
+    # by itself has to be kept by a person first.
+    if _edition_entry(user_id, item_id).get("auto_confirmed_at"):
+        return jsonify({"error": "Review the automatically confirmed edition on the Editions page before importing"}), 400
 
     try:
         book = _resolve_abs_book(user_id, item_id)
@@ -2315,6 +2407,26 @@ def api_edition_confirm(item_id):
     })
 
 
+@app.route("/api/editions/<item_id>/undo-auto", methods=["POST"])
+@needs_abs_item()
+def api_edition_undo_auto(item_id):
+    """Turn an automatically confirmed edition back into a suggestion, and
+    never auto-confirm this book again, so it waits for a person's pick.
+    Progress sync already wrote to it stays on StoryGraph."""
+    user_id = g.user["id"]
+    with _user_lock(user_id):
+        entry = _edition_entry(user_id, item_id)
+        if not entry.get("auto_confirmed_at"):
+            return jsonify({"error": "This edition wasn't confirmed automatically"}), 409
+        entry["state"] = "suggested"
+        entry["auto_declined"] = True
+        entry.pop("auto_confirmed_at", None)
+        entry.pop("confirmed_at", None)
+        _edition_store.save(user_id)
+    logger.info("[%s] Undid the automatic StoryGraph edition for %s", _user_label(g.user), item_id)
+    return jsonify({"ok": True, "state": "suggested", "auto_confirmed_at": None, "held_until": None})
+
+
 def _known_edition(entry: dict, storygraph_book_id: str) -> dict | None:
     """This book's suggestion or one of its candidates, if it's that edition
     and has its details (a title at least), so confirming it needs no fetch."""
@@ -2356,8 +2468,9 @@ def _tag_error(exc: req.RequestException) -> str:
 @app.route("/api/editions/sync-tags", methods=["POST"])
 def api_edition_tag_sync():
     """Line up confirmed editions and ABS tags, both ways, across the whole
-    library: a book tagged in ABS but not confirmed here is confirmed as the
-    tagged edition, and a confirmed book without a tag gets one. A book
+    library: a book tagged in ABS but not confirmed here (or only confirmed
+    automatically) is confirmed as the tagged edition, and a book a person
+    confirmed without a tag gets one. A book
     confirmed here as a different edition from its tag is left alone and
     reported, since each was somebody's pick. Never touches StoryGraph."""
     user_id = g.user["id"]
@@ -2371,13 +2484,16 @@ def api_edition_tag_sync():
         for book in books:
             item_id, tagged_id = book["abs_item_id"], book.get("storygraph_tag")
             confirmed_id = _confirmed_edition_id(user_id, item_id)
-            if tagged_id and not confirmed_id:
+            # An automatic confirmation isn't anybody's pick, so a tag
+            # overrides it and it isn't tagged until a person keeps it.
+            auto = bool(_edition_entry(user_id, item_id).get("auto_confirmed_at"))
+            if tagged_id and (not confirmed_id or (auto and tagged_id != confirmed_id)):
                 entry = editions.setdefault(item_id, {})
                 # A tag carries only the id; the details are kept when a
                 # lookup already found this edition.
                 _confirm_entry(entry, _known_edition(entry, tagged_id) or _bare_edition_json(tagged_id))
                 confirmed.append(item_id)
-            elif confirmed_id and not tagged_id:
+            elif confirmed_id and not tagged_id and not auto:
                 to_tag.append((item_id, confirmed_id))
             elif tagged_id and tagged_id != confirmed_id:
                 conflicts.append(book["title"])
@@ -2427,6 +2543,8 @@ def api_settings():
         return jsonify({"error": "Invalid SYNC_SCOPE"}), 400
     if data.get("SYNC_MODE") and data["SYNC_MODE"] not in SYNC_MODES:
         return jsonify({"error": "Invalid SYNC_MODE"}), 400
+    if data.get("AUTO_CONFIRM_EDITIONS") and data["AUTO_CONFIRM_EDITIONS"] not in AUTO_CONFIRM_CHOICES:
+        return jsonify({"error": "Invalid AUTO_CONFIRM_EDITIONS"}), 400
     if data.get("DAILY_SYNC_TIME"):
         try:
             _parse_daily_sync_time(data["DAILY_SYNC_TIME"])

@@ -5,8 +5,9 @@ let clearedLogSeq = 0;  // lines up to this one were cleared
 let readOnlyMode = false;
 
 // The picked button in each settings toggle row, keyed by its data attribute:
-// data-scope="…" buttons set choices.scope, data-mode="…" set choices.mode.
-const choices = { scope: null, mode: null };
+// data-scope="…" buttons set choices.scope, data-mode="…" set choices.mode,
+// data-auto="…" set choices.auto.
+const choices = { scope: null, mode: null, auto: null };
 
 const SCOPE_HEADERS = {
   in_progress: 'Currently Listening',
@@ -27,7 +28,7 @@ function renderChoices() {
   document.getElementById('daily-time-field').style.display = choices.mode === 'daily' ? 'flex' : 'none';
 }
 
-document.querySelectorAll('[data-scope], [data-mode]').forEach(btn => {
+document.querySelectorAll('[data-scope], [data-mode], [data-auto]').forEach(btn => {
   btn.onclick = () => {
     Object.assign(choices, btn.dataset);
     renderChoices();
@@ -192,6 +193,13 @@ function editionSection(itemId, data) {
   const edition = data.matched_edition;
   const pick = id => `postEditionChoice(${jsArg(itemId)}, ${jsArg(id)})`;
   const others = otherCandidates(data.candidates, edition);
+  if (data.edition_state === 'auto') {
+    return `<div class="history-note">${editionBadge('auto')} Edition: <strong>${editionTitleLink(edition, editionFallbackTitle(edition, data.book))}</strong> ${editionDetails(edition, data.book)}
+      <button class="btn btn-primary" style="margin-left:0.5rem" onclick="${pick(edition.storygraph_book_id)}">Keep</button>
+      <a class="btn btn-ghost" href="/editions?q=${encodeURIComponent(data.book.title)}">Review</a>
+      ${matchReasonText(data.match_reason)}</div>
+      <div class="history-note">Sync confirmed this edition automatically. Keep it before importing, since imported days can't be undone.</div>`;
+  }
   if (data.edition_state === 'confirmed') {
     return `<div class="history-note">${editionBadge('confirmed')} Edition: <strong>${editionTitleLink(edition, editionFallbackTitle(edition, data.book))}</strong> ${editionDetails(edition, data.book)}</div>`;
   }
@@ -407,6 +415,7 @@ async function loadSettings() {
     }
     choices.scope = d.SYNC_SCOPE;
     choices.mode = d.SYNC_MODE;
+    choices.auto = d.AUTO_CONFIRM_EDITIONS;
     document.getElementById('s-daily-time').value = d.DAILY_SYNC_TIME;
     document.getElementById('timezone-hint').textContent = `Uses ${d.TIMEZONE}.`;
     renderChoices();
@@ -424,6 +433,7 @@ async function saveSettings(e) {
   }
   payload.SYNC_SCOPE = choices.scope;
   payload.SYNC_MODE = choices.mode;
+  payload.AUTO_CONFIRM_EDITIONS = choices.auto;
   payload.DAILY_SYNC_TIME = document.getElementById('s-daily-time').value || '00:00';
   payload.TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
   try {
