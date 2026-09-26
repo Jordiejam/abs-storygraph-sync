@@ -445,9 +445,10 @@ a:hover { text-decoration: underline; }
 .edition-book .book-author { margin-top: 0.2rem; }
 .edition-book .tag { margin-left: 0.3rem; vertical-align: middle; }
 .edition-status { display: flex; gap: 0.6rem; align-items: flex-start; font-size: 0.8rem; min-width: 0; }
+.edition-status > div { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .edition-title { font-weight: 500; margin-bottom: 0.15rem; }
 .check-tags { display: flex; flex-wrap: wrap; gap: 0.3rem; margin-top: 0.3rem; }
-.check-tags .tag { margin-right: 0; }
+.check-tags .tag { margin-right: 0; white-space: normal; }
 .book-extra { font-size: 0.72rem; margin-top: 0.15rem; }
 .tag-read { color: var(--accent2); background: rgba(139, 92, 246, 0.14); }
 .read-note {
